@@ -316,7 +316,7 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 	record.cmd = cmd
 	record.pid = cmd.Process.Pid
 
-	cleanup := func() {
+	cleanup = func() {
 		_ = terminateProcess(cmd.Process)
 		_, _ = cmd.Process.Wait()
 		_ = os.Remove(socketPath)
