@@ -176,7 +176,10 @@ Incoming requests are matched against the `Host` header. For each match, the
 proxy queries the control plane for the machine's recorded guest endpoint and
 forwards HTTP traffic accordingly. You can override the listen address with
 `--listen` or the control plane location with `--control-plane-url`. A built-in
-health probe responds on `/healthz`.【F:internal/proxy/proxy.go†L21-L174】
+health probe responds on `/healthz`.【F:internal/proxy/proxy.go†L21-L174】 Set
+`LOG_LEVEL=debug` (or `LOG_LEVEL=1`) before launching the proxy if you want to
+emit access logs that include the resolved backend, status code, and latency for
+every request.【F:internal/proxy/proxy.go†L57-L132】
 
 With this setup, visiting `http://app1.localhost:8080` will forward traffic to
 `machine-app1` as soon as the VM advertises a `guest_address` or
