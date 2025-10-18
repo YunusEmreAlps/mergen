@@ -10,6 +10,9 @@ CPU_COUNT=${CPU_COUNT:-1}
 MEM_SIZE_MB=${MEM_SIZE_MB:-512}
 CONTAINER_IMAGE_URL=${CONTAINER_IMAGE_URL:-}
 FIRECRACKER_BINARY=${FIRECRACKER_BINARY:-}
+GUEST_ADDRESS=${GUEST_ADDRESS:-}
+GUEST_HTTP_PORT=${GUEST_HTTP_PORT:-}
+GUEST_HTTP_URL=${GUEST_HTTP_URL:-}
 
 if [[ ! -f "${KERNEL_IMAGE_PATH}" ]]; then
     echo "Kernel image not found at ${KERNEL_IMAGE_PATH}" >&2
@@ -29,6 +32,9 @@ JSON_PAYLOAD=$(VM_ID="$VM_ID" \
     MEM_SIZE_MB="$MEM_SIZE_MB" \
     CONTAINER_IMAGE_URL="$CONTAINER_IMAGE_URL" \
     FIRECRACKER_BINARY="$FIRECRACKER_BINARY" \
+    GUEST_ADDRESS="$GUEST_ADDRESS" \
+    GUEST_HTTP_PORT="$GUEST_HTTP_PORT" \
+    GUEST_HTTP_URL="$GUEST_HTTP_URL" \
     python3 - <<'PY'
 import json
 import os
@@ -45,6 +51,12 @@ if os.environ.get("CONTAINER_IMAGE_URL"):
     payload["container_image_url"] = os.environ["CONTAINER_IMAGE_URL"]
 if os.environ.get("FIRECRACKER_BINARY"):
     payload["firecracker_binary"] = os.environ["FIRECRACKER_BINARY"]
+if os.environ.get("GUEST_ADDRESS"):
+    payload["guest_address"] = os.environ["GUEST_ADDRESS"]
+if os.environ.get("GUEST_HTTP_PORT"):
+    payload["guest_http_port"] = int(os.environ["GUEST_HTTP_PORT"])
+if os.environ.get("GUEST_HTTP_URL"):
+    payload["guest_http_url"] = os.environ["GUEST_HTTP_URL"]
 
 print(json.dumps(payload))
 PY
