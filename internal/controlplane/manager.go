@@ -142,6 +142,11 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 	}
 	m.mu.RUnlock()
 
+	sanitizedID := sanitizeResourceID(req.ID)
+	if sanitizedID == "" {
+		sanitizedID = "machine"
+	}
+
 	socketPath := req.SocketPath
 	if socketPath == "" {
 		socketPath = filepath.Join(m.socketDir, fmt.Sprintf("%s.sock", req.ID))
@@ -169,7 +174,7 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 		binary = m.fcBinary
 	}
 
-	cmd := exec.Command(binary, "--api-sock", socketPath, "--id", req.ID)
+	cmd := exec.Command(binary, "--api-sock", socketPath, "--id", sanitizedID)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -216,8 +221,9 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 		return nil, fmt.Errorf("boot-source: %w", err)
 	}
 
-	if err := client.putDrive(ctx, fmt.Sprintf("rootfs-%s", req.ID), driveRequest{
-		DriveID:      fmt.Sprintf("rootfs-%s", req.ID),
+	driveID := sanitizeResourceID(fmt.Sprintf("rootfs_%s", req.ID))
+	if err := client.putDrive(ctx, driveID, driveRequest{
+		DriveID:      driveID,
 		PathOnHost:   req.RootDrivePath,
 		IsRootDevice: true,
 		IsReadOnly:   false,
@@ -378,6 +384,28 @@ func computeGuestURL(address string, port int, explicit string) string {
 		port = 80
 	}
 	return fmt.Sprintf("http://%s:%d", address, port)
+}
+
+func sanitizeResourceID(id string) string {
+	if id == "" {
+		return ""
+	}
+	buf := make([]rune, 0, len(id))
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z':
+			buf = append(buf, r)
+		case r >= 'A' && r <= 'Z':
+			buf = append(buf, r)
+		case r >= '0' && r <= '9':
+			buf = append(buf, r)
+		case r == '_':
+			buf = append(buf, r)
+		default:
+			buf = append(buf, '_')
+		}
+	}
+	return string(buf)
 }
 
 func ensureParentDir(path string) error {
