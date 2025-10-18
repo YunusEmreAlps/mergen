@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,19 +31,22 @@ const (
 )
 
 type MachineRequest struct {
-	ID                string `json:"id"`
-	KernelImagePath   string `json:"kernel_image_path"`
-	RootDrivePath     string `json:"root_drive_path"`
-	CPUCount          int64  `json:"cpu_count"`
-	MemSizeMb         int64  `json:"mem_size_mb"`
-	BootArgs          string `json:"boot_args"`
-	SocketPath        string `json:"socket_path"`
-	LogDir            string `json:"log_dir"`
-	ContainerImageURL string `json:"container_image_url"`
-	FirecrackerBinary string `json:"firecracker_binary"`
-	GuestAddress      string `json:"guest_address"`
-	GuestHTTPPort     int    `json:"guest_http_port"`
-	GuestHTTPURL      string `json:"guest_http_url"`
+	ID                string   `json:"id"`
+	KernelImagePath   string   `json:"kernel_image_path"`
+	RootDrivePath     string   `json:"root_drive_path"`
+	CPUCount          int64    `json:"cpu_count"`
+	MemSizeMb         int64    `json:"mem_size_mb"`
+	BootArgs          string   `json:"boot_args"`
+	SocketPath        string   `json:"socket_path"`
+	LogDir            string   `json:"log_dir"`
+	ContainerImageURL string   `json:"container_image_url"`
+	ContainerCommand  []string `json:"container_command"`
+	ContainerEnv      []string `json:"container_env"`
+	ContainerWorkDir  string   `json:"container_workdir"`
+	FirecrackerBinary string   `json:"firecracker_binary"`
+	GuestAddress      string   `json:"guest_address"`
+	GuestHTTPPort     int      `json:"guest_http_port"`
+	GuestHTTPURL      string   `json:"guest_http_url"`
 }
 
 type MachineStatus struct {
@@ -53,6 +58,10 @@ type MachineStatus struct {
 	PID               int            `json:"pid"`
 	ExitError         string         `json:"exit_error,omitempty"`
 	ContainerImageURL string         `json:"container_image_url,omitempty"`
+	ContainerCommand  []string       `json:"container_command,omitempty"`
+	ContainerEnv      []string       `json:"container_env,omitempty"`
+	ContainerWorkDir  string         `json:"container_workdir,omitempty"`
+	RootDrivePath     string         `json:"root_drive_path,omitempty"`
 	GuestAddress      string         `json:"guest_address,omitempty"`
 	GuestHTTPPort     int            `json:"guest_http_port,omitempty"`
 	GuestHTTPURL      string         `json:"guest_http_url,omitempty"`
@@ -95,10 +104,15 @@ type MachineRecord struct {
 	exitErr           error
 	exitCh            chan struct{}
 	containerImageURL string
+	containerCommand  []string
+	containerEnv      []string
+	containerWorkDir  string
 	guestAddress      string
 	guestHTTPPort     int
 	guestHTTPURL      string
 	kernelCleanup     func()
+	rootDrivePath     string
+	rootDriveCleanup  func()
 	events            []MachineEvent
 	eventMu           sync.Mutex
 }
@@ -109,6 +123,7 @@ type MachineManager struct {
 	socketDir   string
 	logDir      string
 	kernelDir   string
+	rootfsDir   string
 	defaultBoot string
 	fcBinary    string
 }
@@ -156,8 +171,9 @@ func NewMachineManager() (*MachineManager, error) {
 	logDir := filepath.Join(stateDir, defaultLogDirName)
 
 	kernelDir := filepath.Join(stateDir, "kernels")
+	rootfsDir := filepath.Join(stateDir, "rootfs")
 
-	for _, dir := range []string{stateDir, socketDir, logDir, kernelDir} {
+	for _, dir := range []string{stateDir, socketDir, logDir, kernelDir, rootfsDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("create state dir %s: %w", dir, err)
 		}
@@ -176,6 +192,7 @@ func NewMachineManager() (*MachineManager, error) {
 		socketDir:   socketDir,
 		logDir:      logDir,
 		kernelDir:   kernelDir,
+		rootfsDir:   rootfsDir,
 		defaultBoot: defaultBootArgs,
 		fcBinary:    binary,
 	}, nil
@@ -184,9 +201,13 @@ func NewMachineManager() (*MachineManager, error) {
 func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest) (*MachineStatus, error) {
 	var err error
 	var kernelCleanup func()
+	var rootDriveCleanup func()
 	defer func() {
 		if err != nil && kernelCleanup != nil {
 			kernelCleanup()
+		}
+		if err != nil && rootDriveCleanup != nil {
+			rootDriveCleanup()
 		}
 	}()
 
@@ -196,15 +217,12 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 	if req.KernelImagePath == "" {
 		return nil, errors.New("kernel_image_path is required")
 	}
-	if req.RootDrivePath == "" {
-		return nil, errors.New("root_drive_path is required")
+	if req.RootDrivePath == "" && req.ContainerImageURL == "" {
+		return nil, errors.New("root_drive_path or container_image_url is required")
 	}
 
 	if _, err := os.Stat(req.KernelImagePath); err != nil {
 		return nil, fmt.Errorf("kernel image: %w", err)
-	}
-	if _, err := os.Stat(req.RootDrivePath); err != nil {
-		return nil, fmt.Errorf("root drive: %w", err)
 	}
 
 	if req.CPUCount <= 0 {
@@ -256,10 +274,26 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 		createdAt:         time.Now(),
 		exitCh:            make(chan struct{}),
 		containerImageURL: req.ContainerImageURL,
+		containerCommand:  append([]string(nil), req.ContainerCommand...),
+		containerEnv:      append([]string(nil), req.ContainerEnv...),
+		containerWorkDir:  req.ContainerWorkDir,
 		guestAddress:      req.GuestAddress,
 		guestHTTPPort:     req.GuestHTTPPort,
 		guestHTTPURL:      computeGuestURL(req.GuestAddress, req.GuestHTTPPort, req.GuestHTTPURL),
 	}
+
+	rootDrivePath, cleanup, prepErr := m.prepareRootDrive(ctx, record, &req)
+	if prepErr != nil {
+		record.addEvent("error", fmt.Sprintf("root drive preparation failed: %v", prepErr))
+		return nil, wrapMachineError(record, fmt.Errorf("root drive: %w", prepErr))
+	}
+	rootDriveCleanup = cleanup
+	record.rootDrivePath = rootDrivePath
+	if _, statErr := os.Stat(rootDrivePath); statErr != nil {
+		record.addEvent("error", fmt.Sprintf("root drive check failed: %v", statErr))
+		return nil, wrapMachineError(record, fmt.Errorf("root drive: %w", statErr))
+	}
+	req.RootDrivePath = rootDrivePath
 	record.addEvent("creating", "Launching Firecracker process")
 
 	binary := req.FirecrackerBinary
@@ -365,10 +399,12 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 
 	m.mu.Lock()
 	record.kernelCleanup = kernelCleanup
+	record.rootDriveCleanup = rootDriveCleanup
 	m.machines[req.ID] = record
 	m.mu.Unlock()
 
 	kernelCleanup = nil
+	rootDriveCleanup = nil
 
 	go m.monitorMachine(req.ID, record)
 
@@ -380,6 +416,10 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 		CreatedAt:         record.createdAt,
 		PID:               record.pid,
 		ContainerImageURL: req.ContainerImageURL,
+		ContainerCommand:  append([]string(nil), record.containerCommand...),
+		ContainerEnv:      append([]string(nil), record.containerEnv...),
+		ContainerWorkDir:  record.containerWorkDir,
+		RootDrivePath:     record.rootDrivePath,
 		GuestAddress:      record.guestAddress,
 		GuestHTTPPort:     record.guestHTTPPort,
 		GuestHTTPURL:      record.guestHTTPURL,
@@ -387,6 +427,335 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 	}
 
 	return status, nil
+}
+
+func (m *MachineManager) prepareRootDrive(ctx context.Context, record *MachineRecord, req *MachineRequest) (string, func(), error) {
+	if req.RootDrivePath != "" {
+		return req.RootDrivePath, nil, nil
+	}
+	if req.ContainerImageURL == "" {
+		return "", nil, errors.New("root_drive_path or container_image_url is required")
+	}
+	return m.buildRootDriveFromContainer(ctx, record, req)
+}
+
+type dockerImageConfig struct {
+	Env        []string `json:"Env"`
+	Cmd        []string `json:"Cmd"`
+	Entrypoint []string `json:"Entrypoint"`
+	WorkingDir string   `json:"WorkingDir"`
+}
+
+func (m *MachineManager) buildRootDriveFromContainer(ctx context.Context, record *MachineRecord, req *MachineRequest) (string, func(), error) {
+	imageRef := req.ContainerImageURL
+	record.addEvent("container_image", fmt.Sprintf("Preparing container image %s", imageRef))
+
+	tmpDir, err := os.MkdirTemp("", "mergen-container-")
+	if err != nil {
+		return "", nil, fmt.Errorf("create temp dir: %w", err)
+	}
+	rootfsDir := filepath.Join(tmpDir, "rootfs")
+	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("create rootfs dir: %w", err)
+	}
+
+	record.addEvent("container_image", "Pulling image from registry")
+	if _, err := runCommand(ctx, "docker", "pull", imageRef); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("docker pull: %w", err)
+	}
+
+	record.addEvent("container_image", "Inspecting container metadata")
+	configJSON, err := runCommand(ctx, "docker", "image", "inspect", "--format", "{{json .Config}}", imageRef)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("docker inspect: %w", err)
+	}
+	var cfg dockerImageConfig
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("decode docker config: %w", err)
+	}
+
+	record.addEvent("container_image", "Creating temporary container")
+	containerID, err := runCommand(ctx, "docker", "create", imageRef)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("docker create: %w", err)
+	}
+	containerID = strings.TrimSpace(containerID)
+	if containerID == "" {
+		os.RemoveAll(tmpDir)
+		return "", nil, errors.New("docker create returned empty container id")
+	}
+	defer func() {
+		_, _ = runCommand(context.Background(), "docker", "rm", "-f", containerID)
+	}()
+
+	tarPath := filepath.Join(tmpDir, "rootfs.tar")
+	record.addEvent("container_image", "Exporting filesystem layers")
+	if err := exportContainerFilesystem(ctx, containerID, tarPath); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, err
+	}
+
+	record.addEvent("container_image", "Unpacking container filesystem")
+	if _, err := runCommand(ctx, "tar", "-C", rootfsDir, "-xf", tarPath); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("untar rootfs: %w", err)
+	}
+	_ = os.Remove(tarPath)
+
+	resolvedEnv := mergeEnv(cfg.Env, req.ContainerEnv)
+	resolvedCmd := resolveContainerCommand(cfg.Entrypoint, cfg.Cmd, req.ContainerCommand)
+	workDir := req.ContainerWorkDir
+	if workDir == "" {
+		workDir = cfg.WorkingDir
+	}
+
+	if err := configureContainerInit(rootfsDir, resolvedCmd, resolvedEnv, workDir); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("configure init: %w", err)
+	}
+	record.containerCommand = append([]string(nil), resolvedCmd...)
+	record.containerEnv = append([]string(nil), resolvedEnv...)
+	record.containerWorkDir = workDir
+	record.addEvent("container_image", fmt.Sprintf("Initialized boot command: %s", strings.Join(quoteArgs(resolvedCmd), " ")))
+
+	sizeBytes, err := directorySize(rootfsDir)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("rootfs size: %w", err)
+	}
+	extra := sizeBytes / 2
+	const minExtra int64 = 256 * 1024 * 1024
+	if extra < minExtra {
+		extra = minExtra
+	}
+	imageSize := alignSize(sizeBytes+extra, 4096)
+
+	outputPath := filepath.Join(m.rootfsDir, fmt.Sprintf("%s.ext4", sanitizeResourceID(req.ID)))
+	if err := os.MkdirAll(m.rootfsDir, 0o755); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("create rootfs dir: %w", err)
+	}
+	_ = os.Remove(outputPath)
+	file, err := os.Create(outputPath)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("create rootfs: %w", err)
+	}
+	if err := file.Truncate(imageSize); err != nil {
+		file.Close()
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("resize rootfs: %w", err)
+	}
+	file.Close()
+
+	record.addEvent("container_image", fmt.Sprintf("Writing ext4 image (%d MB)", imageSize/1024/1024))
+	if _, err := runCommand(ctx, "mke2fs", "-t", "ext4", "-d", rootfsDir, "-F", outputPath); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("mke2fs: %w", err)
+	}
+
+	os.RemoveAll(tmpDir)
+	record.addEvent("container_image", fmt.Sprintf("Container root drive ready at %s", outputPath))
+	cleanup := func() {
+		_ = os.Remove(outputPath)
+	}
+	return outputPath, cleanup, nil
+}
+
+func exportContainerFilesystem(ctx context.Context, containerID, tarPath string) error {
+	file, err := os.Create(tarPath)
+	if err != nil {
+		return fmt.Errorf("create tar: %w", err)
+	}
+	defer file.Close()
+
+	cmd := exec.CommandContext(ctx, "docker", "export", containerID)
+	cmd.Stdout = file
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker export: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func mergeEnv(base, overrides []string) []string {
+	index := make(map[string]int)
+	var ordered []string
+	appendEnv := func(items []string) {
+		for _, kv := range items {
+			eq := strings.Index(kv, "=")
+			if eq <= 0 {
+				continue
+			}
+			key := kv[:eq]
+			if pos, ok := index[key]; ok {
+				ordered[pos] = kv
+				continue
+			}
+			index[key] = len(ordered)
+			ordered = append(ordered, kv)
+		}
+	}
+	appendEnv(base)
+	appendEnv(overrides)
+	return append([]string(nil), ordered...)
+}
+
+func resolveContainerCommand(entrypoint, cmd, override []string) []string {
+	if len(override) > 0 {
+		return append([]string{}, append(entrypoint, override...)...)
+	}
+	if len(entrypoint) > 0 {
+		return append([]string{}, append(entrypoint, cmd...)...)
+	}
+	if len(cmd) > 0 {
+		return append([]string{}, cmd...)
+	}
+	return []string{"/bin/sh"}
+}
+
+func configureContainerInit(rootfsDir string, command, env []string, workDir string) error {
+	if len(command) == 0 {
+		command = []string{"/bin/sh"}
+	}
+	mergenDir := filepath.Join(rootfsDir, "etc", "mergen")
+	if err := os.MkdirAll(mergenDir, 0o755); err != nil {
+		return fmt.Errorf("create mergen dir: %w", err)
+	}
+	if len(env) > 0 {
+		envPath := filepath.Join(mergenDir, "env.sh")
+		if err := writeEnvFile(envPath, env); err != nil {
+			return err
+		}
+	}
+	if workDir != "" {
+		workPath := filepath.Join(mergenDir, "workdir")
+		if err := os.WriteFile(workPath, []byte(workDir+"\n"), 0o644); err != nil {
+			return fmt.Errorf("write workdir: %w", err)
+		}
+	}
+	sbinDir := filepath.Join(rootfsDir, "sbin")
+	if err := os.MkdirAll(sbinDir, 0o755); err != nil {
+		return fmt.Errorf("create sbin: %w", err)
+	}
+	initPath := filepath.Join(sbinDir, "init")
+	script := buildInitScript(command)
+	if err := os.WriteFile(initPath, []byte(script), 0o755); err != nil {
+		return fmt.Errorf("write init: %w", err)
+	}
+	return nil
+}
+
+func writeEnvFile(path string, env []string) error {
+	var buf bytes.Buffer
+	for _, kv := range env {
+		eq := strings.Index(kv, "=")
+		if eq <= 0 {
+			continue
+		}
+		key := kv[:eq]
+		val := kv[eq+1:]
+		buf.WriteString("export ")
+		buf.WriteString(key)
+		buf.WriteString("=")
+		buf.WriteString(shellQuote(val))
+		buf.WriteString("\n")
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o644)
+}
+
+func buildInitScript(command []string) string {
+	var buf bytes.Buffer
+	buf.WriteString("#!/bin/sh\n")
+	buf.WriteString("set -e\n")
+	buf.WriteString("if [ -f /etc/profile ]; then\n. /etc/profile\nfi\n")
+	buf.WriteString("if [ -f /etc/mergen/env.sh ]; then\n. /etc/mergen/env.sh\nfi\n")
+	buf.WriteString("if [ -f /etc/mergen/workdir ]; then\nMERGEN_WORKDIR=$(cat /etc/mergen/workdir)\nif [ -n \"$MERGEN_WORKDIR\" ]; then\ncd \"$MERGEN_WORKDIR\" 2>/dev/null || echo \"mergen-init: failed to cd to $MERGEN_WORKDIR\" >&2\nfi\nfi\n")
+	buf.WriteString("echo \"[mergen] launching container payload...\" >&2\n")
+	buf.WriteString("set --")
+	for _, arg := range command {
+		buf.WriteByte(' ')
+		buf.WriteString(shellQuote(arg))
+	}
+	buf.WriteString("\nexec \"$@\"\n")
+	return buf.String()
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	var buf strings.Builder
+	buf.WriteByte('\'')
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if ch == '\'' {
+			buf.WriteString("'\\''")
+			continue
+		}
+		buf.WriteByte(ch)
+	}
+	buf.WriteByte('\'')
+	return buf.String()
+}
+
+func quoteArgs(args []string) []string {
+	result := make([]string, 0, len(args))
+	for _, arg := range args {
+		result = append(result, shellQuote(arg))
+	}
+	return result
+}
+
+func directorySize(path string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		return nil
+	})
+	return total, err
+}
+
+func alignSize(size int64, blockSize int64) int64 {
+	if blockSize <= 0 {
+		return size
+	}
+	rem := size % blockSize
+	if rem == 0 {
+		return size
+	}
+	return size + (blockSize - rem)
+}
+
+func runCommand(ctx context.Context, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Run(); err != nil {
+		output := strings.TrimSpace(buf.String())
+		if output != "" {
+			return output, fmt.Errorf("%s %s: %w (output: %s)", name, strings.Join(args, " "), err, output)
+		}
+		return output, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	}
+	return buf.String(), nil
 }
 
 func (m *MachineManager) monitorMachine(id string, record *MachineRecord) {
@@ -442,6 +811,10 @@ func (m *MachineManager) Status(ctx context.Context, id string) (*MachineStatus,
 		CreatedAt:         createdAt,
 		PID:               pid,
 		ContainerImageURL: imageURL,
+		ContainerCommand:  append([]string(nil), record.containerCommand...),
+		ContainerEnv:      append([]string(nil), record.containerEnv...),
+		ContainerWorkDir:  record.containerWorkDir,
+		RootDrivePath:     record.rootDrivePath,
 		GuestAddress:      guestAddress,
 		GuestHTTPPort:     guestPort,
 		GuestHTTPURL:      guestURL,
@@ -484,6 +857,10 @@ func (m *MachineManager) Delete(ctx context.Context, id string) error {
 	_ = os.Remove(record.logPath)
 	if record.kernelCleanup != nil {
 		record.kernelCleanup()
+	}
+	if record.rootDriveCleanup != nil {
+		record.rootDriveCleanup()
+		record.rootDriveCleanup = nil
 	}
 
 	m.mu.Lock()
