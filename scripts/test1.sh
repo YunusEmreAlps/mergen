@@ -24,45 +24,39 @@ if [[ ! -f "${ROOT_DRIVE_PATH}" ]]; then
     exit 1
 fi
 
-JSON_PAYLOAD=$(VM_ID="$VM_ID" \
-    KERNEL_IMAGE_PATH="$KERNEL_IMAGE_PATH" \
-    ROOT_DRIVE_PATH="$ROOT_DRIVE_PATH" \
-    BOOT_ARGS="$BOOT_ARGS" \
-    CPU_COUNT="$CPU_COUNT" \
-    MEM_SIZE_MB="$MEM_SIZE_MB" \
-    CONTAINER_IMAGE_URL="$CONTAINER_IMAGE_URL" \
-    FIRECRACKER_BINARY="$FIRECRACKER_BINARY" \
-    GUEST_ADDRESS="$GUEST_ADDRESS" \
-    GUEST_HTTP_PORT="$GUEST_HTTP_PORT" \
-    GUEST_HTTP_URL="$GUEST_HTTP_URL" \
-    python3 - <<'PY'
-import json
-import os
-
-payload = {
-    "id": os.environ["VM_ID"],
-    "kernel_image_path": os.environ["KERNEL_IMAGE_PATH"],
-    "root_drive_path": os.environ["ROOT_DRIVE_PATH"],
-    "boot_args": os.environ["BOOT_ARGS"],
-    "cpu_count": int(os.environ["CPU_COUNT"]),
-    "mem_size_mb": int(os.environ["MEM_SIZE_MB"]),
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
-if os.environ.get("CONTAINER_IMAGE_URL"):
-    payload["container_image_url"] = os.environ["CONTAINER_IMAGE_URL"]
-if os.environ.get("FIRECRACKER_BINARY"):
-    payload["firecracker_binary"] = os.environ["FIRECRACKER_BINARY"]
-if os.environ.get("GUEST_ADDRESS"):
-    payload["guest_address"] = os.environ["GUEST_ADDRESS"]
-if os.environ.get("GUEST_HTTP_PORT"):
-    payload["guest_http_port"] = int(os.environ["GUEST_HTTP_PORT"])
-if os.environ.get("GUEST_HTTP_URL"):
-    payload["guest_http_url"] = os.environ["GUEST_HTTP_URL"]
 
-print(json.dumps(payload))
-PY
+JSON_PARTS=(
+    "\"id\":\"$(json_escape "$VM_ID")\""
+    "\"kernel_image_path\":\"$(json_escape "$KERNEL_IMAGE_PATH")\""
+    "\"root_drive_path\":\"$(json_escape "$ROOT_DRIVE_PATH")\""
+    "\"boot_args\":\"$(json_escape "$BOOT_ARGS")\""
+    "\"cpu_count\":${CPU_COUNT}"
+    "\"mem_size_mb\":${MEM_SIZE_MB}"
 )
+
+if [[ -n "${CONTAINER_IMAGE_URL}" ]]; then
+    JSON_PARTS+=("\"container_image_url\":\"$(json_escape "$CONTAINER_IMAGE_URL")\"")
+fi
+if [[ -n "${FIRECRACKER_BINARY}" ]]; then
+    JSON_PARTS+=("\"firecracker_binary\":\"$(json_escape "$FIRECRACKER_BINARY")\"")
+fi
+if [[ -n "${GUEST_ADDRESS}" ]]; then
+    JSON_PARTS+=("\"guest_address\":\"$(json_escape "$GUEST_ADDRESS")\"")
+fi
+if [[ -n "${GUEST_HTTP_PORT}" ]]; then
+    JSON_PARTS+=("\"guest_http_port\":${GUEST_HTTP_PORT}")
+fi
+if [[ -n "${GUEST_HTTP_URL}" ]]; then
+    JSON_PARTS+=("\"guest_http_url\":\"$(json_escape "$GUEST_HTTP_URL")\"")
+fi
+
+JSON_JOINED=$(IFS=,; printf '%s' "${JSON_PARTS[*]}")
+JSON_PAYLOAD="{${JSON_JOINED}}"
 
 echo "Creating microVM ${VM_ID}..."
 curl -sS -X POST "${API_URL}/machines" \
     -H 'Content-Type: application/json' \
-    -d "${JSON_PAYLOAD}" | python3 -m json.tool
+    -d "${JSON_PAYLOAD}"

@@ -11,10 +11,11 @@ if [[ -z "${VM_ID}" ]]; then
 fi
 
 echo "Fetching status for ${VM_ID}..."
-curl -sS "${API_URL}/machines/${VM_ID}" | python3 -m json.tool || {
+if ! STATUS_RESPONSE=$(curl -sS "${API_URL}/machines/${VM_ID}"); then
     echo "Unable to read status for ${VM_ID}." >&2
     exit 1
-}
+fi
+printf '%s\n' "${STATUS_RESPONSE}"
 
 if [[ "${DELETE_AFTER_STATUS}" == "true" ]]; then
     echo "Deleting ${VM_ID}..."

@@ -200,7 +200,7 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 	if err := client.putMachineConfig(ctx, machineConfigRequest{
 		VcpuCount:   req.CPUCount,
 		MemSizeMiB:  req.MemSizeMb,
-		HTEnabled:   false,
+		SMT:         false,
 		TrackDirty:  false,
 		CpuTemplate: "None",
 	}); err != nil {
@@ -424,7 +424,7 @@ type firecrackerClient struct {
 type machineConfigRequest struct {
 	VcpuCount   int64  `json:"vcpu_count"`
 	MemSizeMiB  int64  `json:"mem_size_mib"`
-	HTEnabled   bool   `json:"ht_enabled"`
+	SMT         bool   `json:"smt"`
 	TrackDirty  bool   `json:"track_dirty_pages"`
 	CpuTemplate string `json:"cpu_template"`
 }
