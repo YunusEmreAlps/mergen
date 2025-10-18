@@ -22,6 +22,9 @@ control plane and the proxy as separate processes on the same machine.【F:cmd/m
    artifact is gzip-compressed (for example, `vmlinux.bin.gz` or `vmlinuz`),
    the control plane will automatically decompress it into a temporary
    location before starting the VM.【F:internal/controlplane/manager.go†L109-L311】
+   Application binaries (such as Nginx) must be baked into the root filesystem
+   ahead of time; Firecracker cannot inject host-side scripts into a running
+   microVM without an agent inside the guest.
 3. Go 1.20 or newer.
 
 ## Repository layout for images and volumes
@@ -46,6 +49,14 @@ curl -L -o images/rootfs.ext4 \
   https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4
 ```
 
+If you plan to run standard Ubuntu services (for example, Nginx), fetch the
+larger Bionic filesystem that ships with `apt` and a full userspace:
+
+```bash
+curl -L -o images/bionic.rootfs.ext4 \
+  https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/rootfs/bionic.rootfs.ext4
+```
+
 Before creating a VM, copy the base rootfs so that each guest receives its own
 writable disk:
 
@@ -56,6 +67,41 @@ cp images/rootfs.ext4 "volumes/${VM_ID}.ext4"
 
 Use the copy (`./volumes/test1.ext4` in this example) as the
 `root_drive_path` when calling the control plane or the helper scripts.
+
+## Baking Nginx into the root filesystem
+
+Because the control plane cannot execute arbitrary bootstrap commands inside a
+microVM, you should prepare a root filesystem that already contains your
+application. The repository includes `scripts/build_nginx_rootfs.sh`, which
+clones a base Ubuntu Bionic image, installs Nginx, and configures it to start
+on boot so that HTTP traffic is ready as soon as the VM receives an IP address.
+
+Run the helper as `root` (or via `sudo`):
+
+```bash
+sudo BASE_ROOTFS=images/bionic.rootfs.ext4 OUTPUT_ROOTFS=images/bionic-nginx.ext4 \
+  ./scripts/build_nginx_rootfs.sh
+```
+
+The script performs the following steps:
+
+1. Copies `images/bionic.rootfs.ext4` to `images/bionic-nginx.ext4`.
+2. Mounts the copy, injects your host resolver so `apt` works, and installs the
+   `nginx` package with its SysV init hooks enabled.
+3. Unmounts and detaches the loop device so the result is ready for cloning.
+
+To launch guests from this template, create a writable copy per VM as before:
+
+```bash
+VM_ID=app1
+cp images/bionic-nginx.ext4 "volumes/${VM_ID}.ext4"
+export ROOT_DRIVE_PATH=$(pwd)/volumes/${VM_ID}.ext4
+```
+
+After the guest acquires networking, hitting the recorded `guest_http_url`
+should return the default Nginx welcome page. For example, if the microVM is
+reachable on `http://172.16.0.10`, the proxy route for `app1.localhost` will
+forward browser requests directly to that welcome screen.
 
 ## Building the CLI
 
