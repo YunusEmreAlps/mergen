@@ -18,7 +18,10 @@ control plane and the proxy as separate processes on the same machine.【F:cmd/m
    plane.【F:internal/controlplane/manager.go†L77-L110】
 2. Firecracker kernel (`vmlinux.bin`) and root filesystem (`rootfs.ext4`)
    artifacts. Place the pristine downloads under `./images` and create
-   per-VM writable copies under `./volumes` as shown below.【F:internal/controlplane/manager.go†L112-L208】
+   per-VM writable copies under `./volumes` as shown below. If your kernel
+   artifact is gzip-compressed (for example, `vmlinux.bin.gz` or `vmlinuz`),
+   the control plane will automatically decompress it into a temporary
+   location before starting the VM.【F:internal/controlplane/manager.go†L109-L311】
 3. Go 1.20 or newer.
 
 ## Repository layout for images and volumes
@@ -90,7 +93,13 @@ The Echo-based server exposes a health probe and three lifecycle endpoints:
 - `GET /machines/:id` refreshes status information from the Firecracker socket
   when possible.
 - `DELETE /machines/:id` stops the VM, terminates the Firecracker process if
-  needed, and removes the socket/log files.【F:internal/controlplane/server.go†L15-L77】【F:internal/controlplane/manager.go†L210-L330】
+  needed, and removes the socket/log files.【F:internal/controlplane/server.go†L15-L87】【F:internal/controlplane/manager.go†L210-L360】
+
+Each create attempt emits a structured `events` timeline that captures backend
+stages such as launching Firecracker, waiting for the API socket (up to 60
+seconds), pushing configuration, and surfacing any errors. Successful responses
+and error payloads both include this timeline so you can troubleshoot long
+boots or misconfigurations directly from the API.【F:internal/controlplane/server.go†L33-L63】【F:internal/controlplane/manager.go†L118-L330】
 
 Every `POST /machines` payload supports the original kernel/rootfs/CPU/memory
 fields plus optional guest networking metadata that the proxy consumes later:

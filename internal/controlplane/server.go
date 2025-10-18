@@ -55,11 +55,17 @@ func (s *Server) handleCreateMachine(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request().Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request().Context(), 90*time.Second)
 	defer cancel()
 
 	status, err := s.manager.CreateAndStart(ctx, req)
 	if err != nil {
+		if mErr, ok := err.(*MachineError); ok {
+			return c.JSON(http.StatusInternalServerError, map[string]any{
+				"error":  mErr.Error(),
+				"events": mErr.Events,
+			})
+		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
 
