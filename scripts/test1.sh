@@ -9,6 +9,9 @@ BOOT_ARGS=${BOOT_ARGS:-"console=ttyS0 reboot=k panic=1 pci=off"}
 CPU_COUNT=${CPU_COUNT:-1}
 MEM_SIZE_MB=${MEM_SIZE_MB:-512}
 CONTAINER_IMAGE_URL=${CONTAINER_IMAGE_URL:-}
+CONTAINER_CMD_JSON=${CONTAINER_CMD_JSON:-}
+CONTAINER_ENV_JSON=${CONTAINER_ENV_JSON:-}
+CONTAINER_WORKDIR=${CONTAINER_WORKDIR:-}
 FIRECRACKER_BINARY=${FIRECRACKER_BINARY:-}
 GUEST_ADDRESS=${GUEST_ADDRESS:-}
 GUEST_HTTP_PORT=${GUEST_HTTP_PORT:-}
@@ -19,7 +22,12 @@ if [[ ! -f "${KERNEL_IMAGE_PATH}" ]]; then
     exit 1
 fi
 
-if [[ ! -f "${ROOT_DRIVE_PATH}" ]]; then
+if [[ -z "${ROOT_DRIVE_PATH}" && -z "${CONTAINER_IMAGE_URL}" ]]; then
+    echo "Either ROOT_DRIVE_PATH or CONTAINER_IMAGE_URL must be provided." >&2
+    exit 1
+fi
+
+if [[ -n "${ROOT_DRIVE_PATH}" && ! -f "${ROOT_DRIVE_PATH}" ]]; then
     echo "Root drive not found at ${ROOT_DRIVE_PATH}" >&2
     exit 1
 fi
@@ -31,14 +39,26 @@ json_escape() {
 JSON_PARTS=(
     "\"id\":\"$(json_escape "$VM_ID")\""
     "\"kernel_image_path\":\"$(json_escape "$KERNEL_IMAGE_PATH")\""
-    "\"root_drive_path\":\"$(json_escape "$ROOT_DRIVE_PATH")\""
     "\"boot_args\":\"$(json_escape "$BOOT_ARGS")\""
     "\"cpu_count\":${CPU_COUNT}"
     "\"mem_size_mb\":${MEM_SIZE_MB}"
 )
 
+if [[ -n "${ROOT_DRIVE_PATH}" ]]; then
+    JSON_PARTS+=("\"root_drive_path\":\"$(json_escape "$ROOT_DRIVE_PATH")\"")
+fi
+
 if [[ -n "${CONTAINER_IMAGE_URL}" ]]; then
     JSON_PARTS+=("\"container_image_url\":\"$(json_escape "$CONTAINER_IMAGE_URL")\"")
+fi
+if [[ -n "${CONTAINER_CMD_JSON}" ]]; then
+    JSON_PARTS+=("\"container_command\":${CONTAINER_CMD_JSON}")
+fi
+if [[ -n "${CONTAINER_ENV_JSON}" ]]; then
+    JSON_PARTS+=("\"container_env\":${CONTAINER_ENV_JSON}")
+fi
+if [[ -n "${CONTAINER_WORKDIR}" ]]; then
+    JSON_PARTS+=("\"container_workdir\":\"$(json_escape "$CONTAINER_WORKDIR")\"")
 fi
 if [[ -n "${FIRECRACKER_BINARY}" ]]; then
     JSON_PARTS+=("\"firecracker_binary\":\"$(json_escape "$FIRECRACKER_BINARY")\"")

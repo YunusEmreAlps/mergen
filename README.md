@@ -22,10 +22,14 @@ control plane and the proxy as separate processes on the same machine.【F:cmd/m
    artifact is gzip-compressed (for example, `vmlinux.bin.gz` or `vmlinuz`),
    the control plane will automatically decompress it into a temporary
    location before starting the VM.【F:internal/controlplane/manager.go†L109-L311】
-   Application binaries (such as Nginx) must be baked into the root filesystem
-   ahead of time; Firecracker cannot inject host-side scripts into a running
-   microVM without an agent inside the guest.
-3. Go 1.20 or newer.
+   You can either prepare the rootfs manually (see below) or let the control
+   plane synthesize one from a Docker/OCI image on demand.
+3. For container-image imports, install the Docker CLI (or a compatible
+   implementation that supports `docker pull`, `docker create`, and
+   `docker export`) and ensure `mke2fs`/`tar` are available. The control plane
+   shells out to these tools when turning container layers into writable ext4
+   volumes.【F:internal/controlplane/manager.go†L312-L520】
+4. Go 1.20 or newer.
 
 ## Repository layout for images and volumes
 
@@ -67,6 +71,40 @@ cp images/rootfs.ext4 "volumes/${VM_ID}.ext4"
 
 Use the copy (`./volumes/test1.ext4` in this example) as the
 `root_drive_path` when calling the control plane or the helper scripts.
+
+## Launching microVMs from container images
+
+If you would rather boot directly from a Docker/OCI image, omit
+`root_drive_path` and provide `container_image_url` instead. The control plane
+will:
+
+1. `docker pull` and `docker export` the requested image into a temporary
+   directory.
+2. Merge the image's `Entrypoint`, `Cmd`, environment, and working directory
+   with any overrides you pass via `container_command`, `container_env`, and
+   `container_workdir`.
+3. Generate an `ext4` root disk inside `${MERGEN_STATE_DIR}/rootfs/<id>.ext4`
+   using `mke2fs -d`, replacing `/sbin/init` with a lightweight launcher that
+   executes the resolved command on boot.【F:internal/controlplane/manager.go†L312-L520】
+
+The synthesized disk is deleted automatically when you remove the VM. Because
+the bootstrapper reuses container metadata, you can run any image that ships a
+POSIX-compatible userspace (for example, `nginx:latest` or
+`ghcr.io/user/webapp:1.0`). To override the command, pass a JSON array in
+`container_command`:
+
+```bash
+export CONTAINER_IMAGE_URL=nginx:latest
+export CONTAINER_CMD_JSON='["nginx","-g","daemon off;"]'
+./scripts/test1.sh
+```
+
+To inject additional environment variables, provide a JSON array in
+`container_env` (values later in the list override the image defaults). You can
+also set `container_workdir` if the image expects a specific working directory.
+The resolved values are echoed back in the create response and through
+`GET /machines/:id` so the proxy and observability tooling can inspect the
+launch configuration.【F:internal/controlplane/manager.go†L170-L340】【F:internal/controlplane/manager.go†L360-L420】
 
 ## Baking Nginx into the root filesystem
 
@@ -168,13 +206,23 @@ If you omit `guest_http_url`, the control plane will build it from
 URL are surfaced on `GET /machines/:id` so that the proxy can discover them
 later.【F:internal/controlplane/manager.go†L32-L206】【F:internal/controlplane/manager.go†L244-L293】
 
+To boot directly from a registry image, skip `root_drive_path` and pass
+`"container_image_url": "nginx:latest"` along with any of the optional
+`container_*` overrides described above. The create response and subsequent
+status calls will echo the resolved command, environment, working directory,
+and the synthesized root drive path so that operators can audit the launch
+configuration.【F:internal/controlplane/manager.go†L170-L420】
+
 ### Helper scripts
 
 The `scripts/` folder includes two `curl`-based helpers for quick manual tests:
 
-- `scripts/test1.sh` validates the kernel/rootfs paths, builds a JSON payload,
-  and sends `POST /machines`. Set `GUEST_ADDRESS`, `GUEST_HTTP_PORT`, or
-  `GUEST_HTTP_URL` to record how the guest will be reachable.【F:scripts/test1.sh†L1-L56】
+- `scripts/test1.sh` validates your inputs, builds a JSON payload, and sends
+  `POST /machines`. Provide either `ROOT_DRIVE_PATH` or
+  `CONTAINER_IMAGE_URL`, and optionally override the container metadata via
+  `CONTAINER_CMD_JSON`, `CONTAINER_ENV_JSON`, or `CONTAINER_WORKDIR`.
+  Networking hints remain the same: set `GUEST_ADDRESS`, `GUEST_HTTP_PORT`, or
+  `GUEST_HTTP_URL` to record how the guest will be reachable.【F:scripts/test1.sh†L1-L70】
 - `scripts/test2.sh` fetches the latest status and optionally issues
   `DELETE /machines/:id` (disable deletion with `DELETE_AFTER_STATUS=false`).【F:scripts/test2.sh†L1-L21】
 
