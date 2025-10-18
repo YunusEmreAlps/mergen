@@ -1,4 +1,4 @@
-package main
+package controlplane
 
 import (
 	"bytes"
@@ -15,8 +15,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/labstack/echo/v4"
 )
 
 const (
@@ -38,6 +36,9 @@ type MachineRequest struct {
 	LogDir            string `json:"log_dir"`
 	ContainerImageURL string `json:"container_image_url"`
 	FirecrackerBinary string `json:"firecracker_binary"`
+	GuestAddress      string `json:"guest_address"`
+	GuestHTTPPort     int    `json:"guest_http_port"`
+	GuestHTTPURL      string `json:"guest_http_url"`
 }
 
 type MachineStatus struct {
@@ -49,6 +50,9 @@ type MachineStatus struct {
 	PID               int       `json:"pid"`
 	ExitError         string    `json:"exit_error,omitempty"`
 	ContainerImageURL string    `json:"container_image_url,omitempty"`
+	GuestAddress      string    `json:"guest_address,omitempty"`
+	GuestHTTPPort     int       `json:"guest_http_port,omitempty"`
+	GuestHTTPURL      string    `json:"guest_http_url,omitempty"`
 }
 
 type MachineRecord struct {
@@ -61,6 +65,9 @@ type MachineRecord struct {
 	exitErr           error
 	exitCh            chan struct{}
 	containerImageURL string
+	guestAddress      string
+	guestHTTPPort     int
+	guestHTTPURL      string
 }
 
 type MachineManager struct {
@@ -234,6 +241,9 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 		pid:               cmd.Process.Pid,
 		exitCh:            make(chan struct{}),
 		containerImageURL: req.ContainerImageURL,
+		guestAddress:      req.GuestAddress,
+		guestHTTPPort:     req.GuestHTTPPort,
+		guestHTTPURL:      computeGuestURL(req.GuestAddress, req.GuestHTTPPort, req.GuestHTTPURL),
 	}
 
 	if infoErr == nil {
@@ -255,6 +265,9 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 		CreatedAt:         record.createdAt,
 		PID:               record.pid,
 		ContainerImageURL: req.ContainerImageURL,
+		GuestAddress:      record.guestAddress,
+		GuestHTTPPort:     record.guestHTTPPort,
+		GuestHTTPURL:      record.guestHTTPURL,
 	}
 
 	return status, nil
@@ -291,6 +304,9 @@ func (m *MachineManager) Status(ctx context.Context, id string) (*MachineStatus,
 	pid := record.pid
 	exitErr := record.exitErr
 	imageURL := record.containerImageURL
+	guestAddress := record.guestAddress
+	guestPort := record.guestHTTPPort
+	guestURL := record.guestHTTPURL
 	m.mu.RUnlock()
 
 	client := newFirecrackerClient(socketPath)
@@ -307,6 +323,9 @@ func (m *MachineManager) Status(ctx context.Context, id string) (*MachineStatus,
 		CreatedAt:         createdAt,
 		PID:               pid,
 		ContainerImageURL: imageURL,
+		GuestAddress:      guestAddress,
+		GuestHTTPPort:     guestPort,
+		GuestHTTPURL:      guestURL,
 	}
 	if exitErr != nil {
 		result.ExitError = exitErr.Error()
@@ -348,6 +367,19 @@ func (m *MachineManager) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func computeGuestURL(address string, port int, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if address == "" {
+		return ""
+	}
+	if port <= 0 {
+		port = 80
+	}
+	return fmt.Sprintf("http://%s:%d", address, port)
+}
+
 func ensureParentDir(path string) error {
 	dir := filepath.Dir(path)
 	return os.MkdirAll(dir, 0o755)
@@ -377,7 +409,6 @@ func terminateProcess(proc *os.Process) error {
 	if proc == nil {
 		return nil
 	}
-	// send SIGTERM to the process group so child threads exit cleanly
 	if err := syscall.Kill(-proc.Pid, syscall.SIGTERM); err != nil {
 		if !errors.Is(err, os.ErrProcessDone) && err != syscall.ESRCH {
 			return err
@@ -502,60 +533,4 @@ func (c *firecrackerClient) do(ctx context.Context, method, path string, payload
 
 	io.Copy(io.Discard, resp.Body)
 	return nil
-}
-
-func main() {
-	manager, err := NewMachineManager()
-	if err != nil {
-		panic(err)
-	}
-	e := echo.New()
-
-	e.GET("/health", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
-	})
-
-	e.POST("/machines", func(c echo.Context) error {
-		var req MachineRequest
-		if err := c.Bind(&req); err != nil {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
-		}
-
-		ctx, cancel := context.WithTimeout(c.Request().Context(), 30*time.Second)
-		defer cancel()
-
-		status, err := manager.CreateAndStart(ctx, req)
-		if err != nil {
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		}
-
-		return c.JSON(http.StatusCreated, status)
-	})
-
-	e.GET("/machines/:id", func(c echo.Context) error {
-		id := c.Param("id")
-		ctx, cancel := context.WithTimeout(c.Request().Context(), 5*time.Second)
-		defer cancel()
-
-		status, err := manager.Status(ctx, id)
-		if err != nil {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
-		}
-
-		return c.JSON(http.StatusOK, status)
-	})
-
-	e.DELETE("/machines/:id", func(c echo.Context) error {
-		id := c.Param("id")
-		ctx, cancel := context.WithTimeout(c.Request().Context(), 15*time.Second)
-		defer cancel()
-
-		if err := manager.Delete(ctx, id); err != nil {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
-		}
-
-		return c.NoContent(http.StatusNoContent)
-	})
-
-	e.Logger.Fatal(e.Start(":1323"))
 }

@@ -1,115 +1,181 @@
-# Mergen Firecracker Control Plane
+# Mergen Firecracker Toolkit
 
-This repository exposes a small HTTP control plane that can create, inspect, and
-tear down Firecracker microVMs. The service launches the Firecracker binary,
-pushes the machine configuration over its REST API, and tracks lifecycle state
-in memory so that callers can query `/machines/:id` for status or issue deletes
-when a VM is no longer needed.【F:main.go†L30-L258】【F:main.go†L507-L560】
+This repository provides two small Go services for driving Firecracker microVMs:
 
-The server listens on port `1323` by default and provides:
+- a control plane API that launches VMs, tracks their lifecycle, and records the
+  guests' HTTP endpoints; and
+- a host-level reverse proxy that maps incoming domains (for example,
+  `app1.localhost`) to the appropriate Firecracker guest.
 
-- `POST /machines` — Launch a microVM based on the supplied kernel, rootfs,
-  CPU/memory, and optional metadata.
-- `GET /machines/:id` — Read live status from the Firecracker API socket when
-  possible and fall back to the tracked process state.
-- `DELETE /machines/:id` — Ask Firecracker to stop, fall back to a SIGTERM, and
-  remove the associated Unix socket and log file.【F:main.go†L507-L560】
+Both services ship in a single CLI called `mergencli` so that you can run the
+control plane and the proxy as separate processes on the same machine.【F:cmd/mergencli/main.go†L1-L120】
 
 ## Prerequisites
 
-1. A host with KVM support and the Firecracker binary installed (e.g. following
-   the instructions in `instructions.sh`). If the binary is not on your `$PATH`,
-   set `MERGEN_FIRECRACKER_BIN` (or `FIRECRACKER_BINARY`) to the absolute path
-   before starting the service.【F:main.go†L75-L103】【F:main.go†L160-L167】
-2. A kernel image (`vmlinux.bin`) and a root filesystem (`rootfs.ext4`) that are
-   compatible with Firecracker.【F:main.go†L110-L217】
-3. Go 1.20+ to build or run the control plane.
+1. A KVM-capable Linux host with the Firecracker binary installed. If the
+   executable is not on your `$PATH`, set `MERGEN_FIRECRACKER_BIN` (or
+   `FIRECRACKER_BINARY`) to the absolute path before starting the control
+   plane.【F:internal/controlplane/manager.go†L77-L110】
+2. Firecracker kernel (`vmlinux.bin`) and root filesystem (`rootfs.ext4`)
+   artifacts. Place the pristine downloads under `./images` and create
+   per-VM writable copies under `./volumes` as shown below.【F:internal/controlplane/manager.go†L112-L208】
+3. Go 1.20 or newer.
 
 ## Repository layout for images and volumes
 
-To keep downloads and writable disks organized inside this repo, use the
-following structure:
+Keep the base artifacts in `images/` and create writable clones in `volumes/`.
+This keeps the repository organized and mirrors the parameters that the control
+plane expects:
 
 ```
 mergen/
-├── images/   # read-only assets shared by many VMs (kernel + pristine rootfs)
-└── volumes/  # per-VM writable copies of the base rootfs
+├── images/   # read-only kernel + base rootfs
+└── volumes/  # per-VM writable drives copied from images/
 ```
 
-Create these directories once:
+Prepare the folders and download the Firecracker demo artifacts once:
 
 ```bash
 mkdir -p images volumes
-```
-
-### Downloading base artifacts
-
-You can reuse the artifacts from the official Firecracker quickstart:
-
-```bash
 curl -L -o images/vmlinux.bin \
   https://s3.amazonaws.com/spec.ccfc.min/img/hello/kernel/vmlinux.bin
 curl -L -o images/rootfs.ext4 \
   https://s3.amazonaws.com/spec.ccfc.min/img/hello/fsfiles/hello-rootfs.ext4
 ```
 
-Keep the files in `images/` read-only so you can clone them for each VM you
-launch.
-
-### Preparing per-VM writable disks
-
-Before creating a VM, copy the base rootfs into `volumes/` and point the API
-request at the copy. Each Firecracker microVM needs its own writable block
-device so that state changes do not modify the shared base image:
+Before creating a VM, copy the base rootfs so that each guest receives its own
+writable disk:
 
 ```bash
 VM_ID=test1
 cp images/rootfs.ext4 "volumes/${VM_ID}.ext4"
 ```
 
-Use the new path (`./volumes/test1.ext4` in this example) as the
-`root_drive_path` when calling the API or running the helper scripts.【F:main.go†L212-L258】
+Use the copy (`./volumes/test1.ext4` in this example) as the
+`root_drive_path` when calling the control plane or the helper scripts.
 
-## Running the control plane
+## Building the CLI
 
 From the repository root:
 
 ```bash
-go run .
+go build -o mergencli ./cmd/mergencli
 ```
 
-Optional environment variables:
+This produces a single binary with two subcommands: `control-plane` and
+`proxy`. Run each one in its own terminal so that the control plane and the
+reverse proxy stay independent.【F:cmd/mergencli/main.go†L15-L120】
 
-- `MERGEN_STATE_DIR`: directory that will receive Firecracker sockets and log
-  files. Defaults to `${TMPDIR}/mergen` if unset.【F:main.go†L75-L155】
-- `MERGEN_FIRECRACKER_BIN` (or `FIRECRACKER_BINARY`): override the Firecracker
-  binary path if it is not just `firecracker` in your `$PATH`.【F:main.go†L89-L167】
+## Running the control plane
 
-The service exposes a simple health probe at `GET /health` and the machine
-lifecycle endpoints listed above.【F:main.go†L514-L560】
+Start the API server on port `1323` (override with `--listen` if desired):
 
-## Testing the endpoints with scripts
+```bash
+./mergencli control-plane serve --listen :1323
+```
 
-Two helper scripts under `scripts/` exercise the API using `curl`:
+The control plane uses the following environment variables:
 
-- `scripts/test1.sh` — posts JSON to `/machines` with the kernel/rootfs paths
-  you provide via environment variables. It validates that the files exist
-  before sending the request.【F:scripts/test1.sh†L4-L56】
-- `scripts/test2.sh` — fetches `/machines/:id` and optionally deletes the VM.
-  Set `DELETE_AFTER_STATUS=false` if you want to keep it running.【F:scripts/test2.sh†L4-L22】
+- `MERGEN_STATE_DIR`: where to store Firecracker API sockets and log files
+  (defaults to `${TMPDIR}/mergen`).【F:internal/controlplane/manager.go†L77-L110】
+- `MERGEN_FIRECRACKER_BIN` / `FIRECRACKER_BINARY`: override the Firecracker
+  binary path if it is not simply `firecracker` in your `$PATH`.【F:internal/controlplane/manager.go†L92-L110】
 
-Example usage, assuming you followed the directory layout above:
+### API overview
+
+The Echo-based server exposes a health probe and three lifecycle endpoints:
+
+- `GET /health` returns `{ "status": "ok" }`.
+- `POST /machines` launches a VM using the supplied payload.
+- `GET /machines/:id` refreshes status information from the Firecracker socket
+  when possible.
+- `DELETE /machines/:id` stops the VM, terminates the Firecracker process if
+  needed, and removes the socket/log files.【F:internal/controlplane/server.go†L15-L77】【F:internal/controlplane/manager.go†L210-L330】
+
+Every `POST /machines` payload supports the original kernel/rootfs/CPU/memory
+fields plus optional guest networking metadata that the proxy consumes later:
+
+```json
+{
+  "id": "machine-app1",
+  "kernel_image_path": "./images/vmlinux.bin",
+  "root_drive_path": "./volumes/machine-app1.ext4",
+  "cpu_count": 1,
+  "mem_size_mb": 512,
+  "guest_address": "172.16.0.10",
+  "guest_http_port": 8080,
+  "guest_http_url": "http://172.16.0.10:8080"
+}
+```
+
+If you omit `guest_http_url`, the control plane will build it from
+`guest_address` and `guest_http_port` (defaulting to port 80). The address and
+URL are surfaced on `GET /machines/:id` so that the proxy can discover them
+later.【F:internal/controlplane/manager.go†L32-L206】【F:internal/controlplane/manager.go†L244-L293】
+
+### Helper scripts
+
+The `scripts/` folder includes two `curl`-based helpers for quick manual tests:
+
+- `scripts/test1.sh` validates the kernel/rootfs paths, builds a JSON payload,
+  and sends `POST /machines`. Set `GUEST_ADDRESS`, `GUEST_HTTP_PORT`, or
+  `GUEST_HTTP_URL` to record how the guest will be reachable.【F:scripts/test1.sh†L1-L56】
+- `scripts/test2.sh` fetches the latest status and optionally issues
+  `DELETE /machines/:id` (disable deletion with `DELETE_AFTER_STATUS=false`).【F:scripts/test2.sh†L1-L21】
+
+Example session:
 
 ```bash
 export API_URL=http://127.0.0.1:1323
-export VM_ID=test1
+export VM_ID=machine-app1
 export KERNEL_IMAGE_PATH=$(pwd)/images/vmlinux.bin
 export ROOT_DRIVE_PATH=$(pwd)/volumes/${VM_ID}.ext4
+export GUEST_ADDRESS=172.16.0.10
+export GUEST_HTTP_PORT=8080
 
 ./scripts/test1.sh   # create the VM
-./scripts/test2.sh   # read status and delete it (default behavior)
+./scripts/test2.sh   # check status (and delete by default)
 ```
 
-If you would like to map a VM back to a container image or other metadata,
-include `CONTAINER_IMAGE_URL` in the environment when running `test1.sh`. The
-value is stored alongside the machine status and surfaced in the API response.【F:main.go†L30-L258】
+## Running the host proxy
+
+Once the control plane is running, start the reverse proxy in a separate
+terminal. The proxy reads a JSON configuration file that maps incoming host
+names to either a machine ID (resolved through the control plane) or a static
+HTTP endpoint.
+
+Create `proxy-config.json` with routes for each domain you want to expose:
+
+```json
+{
+  "listen_addr": ":8080",
+  "control_plane_url": "http://127.0.0.1:1323",
+  "routes": {
+    "app1.localhost": { "machine_id": "machine-app1" },
+    "app2.localhost": { "machine_id": "machine-app2" }
+  }
+}
+```
+
+Launch the proxy:
+
+```bash
+./mergencli proxy serve --config proxy-config.json
+```
+
+Incoming requests are matched against the `Host` header. For each match, the
+proxy queries the control plane for the machine's recorded guest endpoint and
+forwards HTTP traffic accordingly. You can override the listen address with
+`--listen` or the control plane location with `--control-plane-url`. A built-in
+health probe responds on `/healthz`.【F:internal/proxy/proxy.go†L21-L174】
+
+With this setup, visiting `http://app1.localhost:8080` will forward traffic to
+`machine-app1` as soon as the VM advertises a `guest_address` or
+`guest_http_url` via the control plane.【F:internal/proxy/proxy.go†L176-L209】
+
+## Development tips
+
+- The control plane keeps state in memory. Restarting the process clears the
+  registry of VMs, so plan to recreate or reconcile machines on boot.
+- Both services honor `SIGINT`/`SIGTERM` for graceful shutdowns, making it easy
+  to run them under `systemd` or a supervisor of your choice.【F:cmd/mergencli/main.go†L88-L120】【F:internal/proxy/proxy.go†L95-L118】
