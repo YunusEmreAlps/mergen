@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -37,6 +38,7 @@ type Proxy struct {
 	client     *http.Client
 	transport  *http.Transport
 	routeMutex sync.RWMutex
+	debug      bool
 }
 
 type machineStatus struct {
@@ -100,11 +102,18 @@ func New(cfg Config) (*Proxy, error) {
 	transport := &http.Transport{}
 	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
 
+	debug := false
+	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
+	case "debug", "1":
+		debug = true
+	}
+
 	return &Proxy{
 		cfg:       cfg,
 		routes:    cfg.Routes,
 		client:    client,
 		transport: transport,
+		debug:     debug,
 	}, nil
 }
 
@@ -126,9 +135,27 @@ func (p *Proxy) Serve(ctx context.Context) error {
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := hostOnly(r.Host)
+	start := time.Now()
+	recorder := &responseRecorder{ResponseWriter: w}
+	var target string
+	var errMsg string
+
+	if p.debug {
+		log.Printf("proxy request start host=%s method=%s path=%s", host, r.Method, r.URL.Path)
+		defer func() {
+			duration := time.Since(start)
+			status := recorder.Status()
+			if errMsg != "" {
+				log.Printf("proxy request done host=%s method=%s path=%s status=%d duration=%s error=%s", host, r.Method, r.URL.Path, status, duration, errMsg)
+				return
+			}
+			log.Printf("proxy request done host=%s method=%s path=%s target=%s status=%d duration=%s", host, r.Method, r.URL.Path, target, status, duration)
+		}()
+	}
+
 	if p.cfg.HealthPath != "" && r.URL.Path == p.cfg.HealthPath {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		recorder.Header().Set("Content-Type", "application/json")
+		_, _ = recorder.Write([]byte(`{"status":"ok"}`))
 		return
 	}
 
@@ -136,28 +163,34 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route, ok := p.routes[host]
 	p.routeMutex.RUnlock()
 	if !ok {
-		http.Error(w, "no route for host", http.StatusBadGateway)
+		errMsg = "no route for host"
+		http.Error(recorder, errMsg, http.StatusBadGateway)
 		return
 	}
 
 	targetURL, err := p.resolveTarget(r.Context(), route)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		errMsg = err.Error()
+		http.Error(recorder, errMsg, http.StatusBadGateway)
 		return
 	}
 
 	parsed, err := url.Parse(targetURL)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("invalid target url: %v", err), http.StatusBadGateway)
+		errMsg = fmt.Sprintf("invalid target url: %v", err)
+		http.Error(recorder, errMsg, http.StatusBadGateway)
 		return
 	}
+
+	target = parsed.String()
 
 	proxy := httputil.NewSingleHostReverseProxy(parsed)
 	proxy.Transport = p.transport
 	proxy.ErrorHandler = func(resp http.ResponseWriter, req *http.Request, e error) {
-		http.Error(resp, fmt.Sprintf("proxy error: %v", e), http.StatusBadGateway)
+		errMsg = fmt.Sprintf("proxy error: %v", e)
+		http.Error(resp, errMsg, http.StatusBadGateway)
 	}
-	proxy.ServeHTTP(w, r)
+	proxy.ServeHTTP(recorder, r)
 }
 
 func (p *Proxy) resolveTarget(ctx context.Context, route RouteConfig) (string, error) {
@@ -237,4 +270,28 @@ func (p *Proxy) UpdateRoute(host string, route RouteConfig) {
 		p.routes = map[string]RouteConfig{}
 	}
 	p.routes[strings.ToLower(host)] = route
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += n
+	return n, err
+}
+
+func (r *responseRecorder) Status() int {
+	if r.status == 0 {
+		return http.StatusOK
+	}
+	return r.status
 }
