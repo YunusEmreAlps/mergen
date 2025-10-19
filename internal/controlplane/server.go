@@ -4,14 +4,18 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/labstack/echo/v4"
 )
 
 type Server struct {
-	manager *MachineManager
-	echo    *echo.Echo
+	manager  *MachineManager
+	echo     *echo.Echo
+	scriptMu sync.RWMutex
+	scripts  map[string]string
 }
 
 func NewServer(manager *MachineManager) *Server {
@@ -20,6 +24,7 @@ func NewServer(manager *MachineManager) *Server {
 	srv := &Server{
 		manager: manager,
 		echo:    e,
+		scripts: make(map[string]string),
 	}
 
 	e.GET("/health", func(c echo.Context) error {
@@ -27,6 +32,7 @@ func NewServer(manager *MachineManager) *Server {
 	})
 
 	e.POST("/machines", srv.handleCreateMachine)
+	e.POST("/bootstrap", srv.handleRegisterScript)
 	e.GET("/machines/:id", srv.handleStatus)
 	e.DELETE("/machines/:id", srv.handleDelete)
 
@@ -53,6 +59,14 @@ func (s *Server) handleCreateMachine(c echo.Context) error {
 	var req MachineRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+
+	if req.StartupScriptID != "" {
+		script, ok := s.lookupScript(req.StartupScriptID)
+		if !ok {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "unknown startup_script_id"})
+		}
+		req.StartupScript = script
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request().Context(), 90*time.Second)
@@ -95,4 +109,39 @@ func (s *Server) handleDelete(c echo.Context) error {
 	}
 
 	return c.NoContent(http.StatusNoContent)
+}
+
+type startupScriptRequest struct {
+	ID     string `json:"id"`
+	Script string `json:"script"`
+}
+
+func (s *Server) handleRegisterScript(c echo.Context) error {
+	var req startupScriptRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "id is required"})
+	}
+	if strings.TrimSpace(req.Script) == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "script is required"})
+	}
+
+	s.scriptMu.Lock()
+	s.scripts[req.ID] = req.Script
+	s.scriptMu.Unlock()
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"id":     req.ID,
+		"length": len(req.Script),
+	})
+}
+
+func (s *Server) lookupScript(id string) (string, bool) {
+	s.scriptMu.RLock()
+	defer s.scriptMu.RUnlock()
+	script, ok := s.scripts[id]
+	return script, ok
 }
