@@ -47,6 +47,8 @@ type MachineRequest struct {
 	GuestAddress      string   `json:"guest_address"`
 	GuestHTTPPort     int      `json:"guest_http_port"`
 	GuestHTTPURL      string   `json:"guest_http_url"`
+	StartupScriptID   string   `json:"startup_script_id"`
+	StartupScript     string   `json:"-"`
 }
 
 type MachineStatus struct {
@@ -65,6 +67,7 @@ type MachineStatus struct {
 	GuestAddress      string         `json:"guest_address,omitempty"`
 	GuestHTTPPort     int            `json:"guest_http_port,omitempty"`
 	GuestHTTPURL      string         `json:"guest_http_url,omitempty"`
+	StartupScriptID   string         `json:"startup_script_id,omitempty"`
 	Events            []MachineEvent `json:"events,omitempty"`
 }
 
@@ -115,6 +118,7 @@ type MachineRecord struct {
 	rootDriveCleanup  func()
 	events            []MachineEvent
 	eventMu           sync.Mutex
+	startupScriptID   string
 }
 
 type MachineManager struct {
@@ -280,6 +284,7 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 		guestAddress:      req.GuestAddress,
 		guestHTTPPort:     req.GuestHTTPPort,
 		guestHTTPURL:      computeGuestURL(req.GuestAddress, req.GuestHTTPPort, req.GuestHTTPURL),
+		startupScriptID:   req.StartupScriptID,
 	}
 
 	rootDrivePath, cleanup, prepErr := m.prepareRootDrive(ctx, record, &req)
@@ -423,6 +428,7 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 		GuestAddress:      record.guestAddress,
 		GuestHTTPPort:     record.guestHTTPPort,
 		GuestHTTPURL:      record.guestHTTPURL,
+		StartupScriptID:   record.startupScriptID,
 		Events:            record.snapshotEvents(),
 	}
 
@@ -431,6 +437,9 @@ func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest)
 
 func (m *MachineManager) prepareRootDrive(ctx context.Context, record *MachineRecord, req *MachineRequest) (string, func(), error) {
 	if req.RootDrivePath != "" {
+		if req.StartupScript != "" {
+			record.addEvent("startup_script", "Startup script ignored because a prebuilt root drive was supplied")
+		}
 		return req.RootDrivePath, nil, nil
 	}
 	if req.ContainerImageURL == "" {
@@ -514,7 +523,10 @@ func (m *MachineManager) buildRootDriveFromContainer(ctx context.Context, record
 		workDir = cfg.WorkingDir
 	}
 
-	if err := configureContainerInit(rootfsDir, resolvedCmd, resolvedEnv, workDir); err != nil {
+	if req.StartupScript != "" {
+		record.addEvent("startup_script", fmt.Sprintf("Embedding startup script %s", describeScriptOrigin(req.StartupScriptID)))
+	}
+	if err := configureContainerInit(rootfsDir, resolvedCmd, resolvedEnv, workDir, req.StartupScript); err != nil {
 		os.RemoveAll(tmpDir)
 		return "", nil, fmt.Errorf("configure init: %w", err)
 	}
@@ -620,7 +632,7 @@ func resolveContainerCommand(entrypoint, cmd, override []string) []string {
 	return []string{"/bin/sh"}
 }
 
-func configureContainerInit(rootfsDir string, command, env []string, workDir string) error {
+func configureContainerInit(rootfsDir string, command, env []string, workDir string, startupScript string) error {
 	if len(command) == 0 {
 		command = []string{"/bin/sh"}
 	}
@@ -640,12 +652,25 @@ func configureContainerInit(rootfsDir string, command, env []string, workDir str
 			return fmt.Errorf("write workdir: %w", err)
 		}
 	}
+	if startupScript != "" {
+		scriptPath := filepath.Join(mergenDir, "startup.sh")
+		contents := startupScript
+		if !strings.HasSuffix(contents, "\n") {
+			contents += "\n"
+		}
+		if !strings.HasPrefix(strings.TrimSpace(contents), "#!/") {
+			contents = "#!/bin/sh\nset -e\n" + contents
+		}
+		if err := os.WriteFile(scriptPath, []byte(contents), 0o755); err != nil {
+			return fmt.Errorf("write startup script: %w", err)
+		}
+	}
 	sbinDir := filepath.Join(rootfsDir, "sbin")
 	if err := os.MkdirAll(sbinDir, 0o755); err != nil {
 		return fmt.Errorf("create sbin: %w", err)
 	}
 	initPath := filepath.Join(sbinDir, "init")
-	script := buildInitScript(command)
+	script := buildInitScript(command, startupScript != "")
 	if err := os.WriteFile(initPath, []byte(script), 0o755); err != nil {
 		return fmt.Errorf("write init: %w", err)
 	}
@@ -670,13 +695,16 @@ func writeEnvFile(path string, env []string) error {
 	return os.WriteFile(path, buf.Bytes(), 0o644)
 }
 
-func buildInitScript(command []string) string {
+func buildInitScript(command []string, hasStartupScript bool) string {
 	var buf bytes.Buffer
 	buf.WriteString("#!/bin/sh\n")
 	buf.WriteString("set -e\n")
 	buf.WriteString("if [ -f /etc/profile ]; then\n. /etc/profile\nfi\n")
 	buf.WriteString("if [ -f /etc/mergen/env.sh ]; then\n. /etc/mergen/env.sh\nfi\n")
 	buf.WriteString("if [ -f /etc/mergen/workdir ]; then\nMERGEN_WORKDIR=$(cat /etc/mergen/workdir)\nif [ -n \"$MERGEN_WORKDIR\" ]; then\ncd \"$MERGEN_WORKDIR\" 2>/dev/null || echo \"mergen-init: failed to cd to $MERGEN_WORKDIR\" >&2\nfi\nfi\n")
+	if hasStartupScript {
+		buf.WriteString("if [ -x /etc/mergen/startup.sh ]; then\necho \"[mergen] running startup script...\" >&2\n/etc/mergen/startup.sh || echo \"mergen-init: startup script exited with $?.\" >&2\nfi\n")
+	}
 	buf.WriteString("echo \"[mergen] launching container payload...\" >&2\n")
 	buf.WriteString("set --")
 	for _, arg := range command {
@@ -818,6 +846,7 @@ func (m *MachineManager) Status(ctx context.Context, id string) (*MachineStatus,
 		GuestAddress:      guestAddress,
 		GuestHTTPPort:     guestPort,
 		GuestHTTPURL:      guestURL,
+		StartupScriptID:   record.startupScriptID,
 		Events:            events,
 	}
 	if exitErr != nil {
@@ -940,6 +969,13 @@ func computeGuestURL(address string, port int, explicit string) string {
 		port = 80
 	}
 	return fmt.Sprintf("http://%s:%d", address, port)
+}
+
+func describeScriptOrigin(id string) string {
+	if id != "" {
+		return fmt.Sprintf("from registry entry %s", id)
+	}
+	return "from inline payload"
 }
 
 func sanitizeResourceID(id string) string {

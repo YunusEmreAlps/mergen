@@ -16,6 +16,7 @@ FIRECRACKER_BINARY=${FIRECRACKER_BINARY:-}
 GUEST_ADDRESS=${GUEST_ADDRESS:-}
 GUEST_HTTP_PORT=${GUEST_HTTP_PORT:-}
 GUEST_HTTP_URL=${GUEST_HTTP_URL:-}
+STARTUP_SCRIPT_ID=${STARTUP_SCRIPT_ID:-}
 
 if [[ ! -f "${KERNEL_IMAGE_PATH}" ]]; then
     echo "Kernel image not found at ${KERNEL_IMAGE_PATH}" >&2
@@ -33,7 +34,12 @@ if [[ -n "${ROOT_DRIVE_PATH}" && ! -f "${ROOT_DRIVE_PATH}" ]]; then
 fi
 
 json_escape() {
-    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//"/\\"}
+    s=${s//$'\n'/\n}
+    s=${s//$'\r'/\r}
+    printf '%s' "$s"
 }
 
 JSON_PARTS=(
@@ -71,6 +77,9 @@ if [[ -n "${GUEST_HTTP_PORT}" ]]; then
 fi
 if [[ -n "${GUEST_HTTP_URL}" ]]; then
     JSON_PARTS+=("\"guest_http_url\":\"$(json_escape "$GUEST_HTTP_URL")\"")
+fi
+if [[ -n "${STARTUP_SCRIPT_ID}" ]]; then
+    JSON_PARTS+=("\"startup_script_id\":\"$(json_escape "$STARTUP_SCRIPT_ID")\"")
 fi
 
 JSON_JOINED=$(IFS=,; printf '%s' "${JSON_PARTS[*]}")

@@ -104,15 +104,39 @@ To inject additional environment variables, provide a JSON array in
 also set `container_workdir` if the image expects a specific working directory.
 The resolved values are echoed back in the create response and through
 `GET /machines/:id` so the proxy and observability tooling can inspect the
-launch configuration.【F:internal/controlplane/manager.go†L170-L340】【F:internal/controlplane/manager.go†L360-L420】
+launch configuration.【F:internal/controlplane/manager.go†L170-L420】
+
+## Registering startup scripts
+
+If you want the control plane to prepare a microVM as soon as it boots,
+register a shell script with `POST /bootstrap` and reference it from the create
+request via `startup_script_id`. The script is stored as `/etc/mergen/startup.sh`
+inside the synthesized root filesystem and runs before the resolved container
+command. Any environment variables supplied through `container_env` are
+available to the script so you can parameterize ports or feature flags without
+hard-coding them.【F:internal/controlplane/server.go†L20-L115】【F:internal/controlplane/manager.go†L300-L360】【F:internal/controlplane/manager.go†L500-L620】
+
+The helper `scripts/test3.sh` demonstrates the flow end to end:
+
+```bash
+./scripts/test3.sh
+```
+
+It registers a `hello-http` bootstrap that installs `netcat`, writes a tiny
+HTTP responder, requests a microVM from the `ubuntu:20.04` container image, and
+then fetches the status payload so you can confirm the startup script ID is
+attached to the instance. Customize the `CONTAINER_IMAGE_URL`,
+`CONTAINER_CMD_JSON`, `CONTAINER_ENV_JSON`, or `STARTUP_SCRIPT_ID` environment
+variables before running the helper if you want to target a different image or
+network port.【F:scripts/test3.sh†L1-L64】
 
 ## Baking Nginx into the root filesystem
 
-Because the control plane cannot execute arbitrary bootstrap commands inside a
-microVM, you should prepare a root filesystem that already contains your
-application. The repository includes `scripts/build_nginx_rootfs.sh`, which
-clones a base Ubuntu Bionic image, installs Nginx, and configures it to start
-on boot so that HTTP traffic is ready as soon as the VM receives an IP address.
+If you prefer immutable root disks over on-the-fly container imports, you can
+still prebuild an image that contains your services. The repository includes
+`scripts/build_nginx_rootfs.sh`, which clones a base Ubuntu Bionic image,
+installs Nginx, and configures it to start on boot so that HTTP traffic is
+ready as soon as the VM receives an IP address.
 
 Run the helper as `root` (or via `sudo`):
 
