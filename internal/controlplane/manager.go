@@ -132,6 +132,54 @@ type MachineManager struct {
 	fcBinary    string
 }
 
+func (m *MachineManager) StreamConsole(ctx context.Context, id string, writer io.Writer) error {
+	m.mu.RLock()
+	record, ok := m.machines[id]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("machine %s not found", id)
+	}
+
+	if record.logPath == "" {
+		return fmt.Errorf("machine %s has no log path", id)
+	}
+
+	file, err := os.Open(record.logPath)
+	if err != nil {
+		return fmt.Errorf("open log: %w", err)
+	}
+	defer file.Close()
+
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n, readErr := file.Read(buf)
+		if n > 0 {
+			if _, writeErr := writer.Write(buf[:n]); writeErr != nil {
+				return writeErr
+			}
+		}
+
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+			continue
+		}
+		return readErr
+	}
+}
+
 func (r *MachineRecord) addEvent(stage, message string) {
 	event := MachineEvent{
 		Timestamp: time.Now(),

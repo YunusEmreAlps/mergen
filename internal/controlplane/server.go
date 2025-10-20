@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v4"
+	"golang.org/x/net/websocket"
 )
 
 type Server struct {
@@ -34,6 +35,7 @@ func NewServer(manager *MachineManager) *Server {
 	e.POST("/machines", srv.handleCreateMachine)
 	e.POST("/bootstrap", srv.handleRegisterScript)
 	e.GET("/machines/:id", srv.handleStatus)
+	e.GET("/machines/:id/console", srv.handleConsole)
 	e.DELETE("/machines/:id", srv.handleDelete)
 
 	return srv
@@ -109,6 +111,53 @@ func (s *Server) handleDelete(c echo.Context) error {
 	}
 
 	return c.NoContent(http.StatusNoContent)
+}
+
+func (s *Server) handleConsole(c echo.Context) error {
+	id := c.Param("id")
+	request := c.Request()
+	response := c.Response()
+
+	handler := websocket.Handler(func(conn *websocket.Conn) {
+		defer conn.Close()
+
+		ctx, cancel := context.WithCancel(request.Context())
+		defer cancel()
+
+		conn.PayloadType = websocket.TextFrame
+
+		go func() {
+			for {
+				var discard []byte
+				if err := websocket.Message.Receive(conn, &discard); err != nil {
+					cancel()
+					return
+				}
+			}
+		}()
+
+		if err := s.manager.StreamConsole(ctx, id, &websocketWriter{Conn: conn}); err != nil && !errors.Is(err, context.Canceled) {
+			_ = websocket.Message.Send(conn, "error: "+err.Error())
+		}
+	})
+
+	handler.ServeHTTP(response, request)
+	return nil
+}
+
+type websocketWriter struct {
+	sync.Mutex
+	Conn *websocket.Conn
+}
+
+func (w *websocketWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	w.Lock()
+	defer w.Unlock()
+	return w.Conn.Write(p)
 }
 
 type startupScriptRequest struct {
