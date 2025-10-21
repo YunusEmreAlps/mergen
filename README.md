@@ -4,6 +4,10 @@
 and an optional HTTP proxy that can discover guests through the control plane.
 This README focuses on the control plane flow that boots guests from a kernel
 image and an `ext4` root filesystem.
+`mergencli` packages a small control plane for launching Firecracker microVMs
+and an optional HTTP proxy that can discover guests through the control plane.
+This README focuses on the control plane flow that boots guests from a kernel
+image and an `ext4` root filesystem.
 
 ## Build the CLI
 
@@ -13,12 +17,15 @@ go build -o mergencli ./cmd/mergencli
 
 ## Run the control plane
 
+## Run the control plane
+
 Start the API server on port `1323` (override with `--listen` if needed):
 
 ```bash
 ./mergencli control-plane serve --listen :1323
 ```
 
+The server honours a few environment variables:
 The server honours a few environment variables:
 
 - `MERGEN_STATE_DIR` controls where API sockets and logs are written
@@ -62,13 +69,17 @@ curl -X POST http://127.0.0.1:1323/DeleteMergenVM \
 
 ### ConsoleMergenVM
 
-`GET /ConsoleMergenVM/:id` upgrades the connection to a WebSocket and pipes all
-traffic between the caller and the Firecracker API socket. You can connect with
-`mergencli control-plane console` or any WebSocket client:
+`GET /ConsoleMergenVM/:id` performs an HTTP upgrade to the `mergen-console`
+protocol and then streams raw console bytes between the caller and the
+Firecracker process. The `mergencli control-plane console` command issues the
+upgrade request and bridges its stdin/stdout to the VM:
 
 ```bash
 ./mergencli control-plane console --id demo --url http://127.0.0.1:1323
 ```
+
+Any HTTP client that can speak HTTP/1.1 and complete the `Upgrade:` handshake
+can reuse the endpoint for interactive sessions.
 
 ## Running tests
 

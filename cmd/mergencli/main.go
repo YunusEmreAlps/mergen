@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
@@ -14,7 +17,6 @@ import (
 
 	"github.com/alperreha/mergen/internal/controlplane"
 	"github.com/alperreha/mergen/internal/proxy"
-	"golang.org/x/net/websocket"
 )
 
 func main() {
@@ -58,9 +60,10 @@ func runControlPlane(args []string) {
 		controlPlaneServe(args[1:])
 	case "console":
 		controlPlaneConsole(args[1:])
+	case "console":
+		controlPlaneConsole(args[1:])
 	case "help", "-h", "--help":
 		fmt.Fprintf(os.Stderr, "usage: mergencli control-plane serve [--listen addr]\n")
-		fmt.Fprintf(os.Stderr, "       mergencli control-plane console --id machine-id [--url http://127.0.0.1:1323]\n")
 		fmt.Fprintf(os.Stderr, "       mergencli control-plane console --id machine-id [--url http://127.0.0.1:1323]\n")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown control-plane subcommand: %s\n", sub)
@@ -105,14 +108,7 @@ func controlPlaneConsole(args []string) {
 		os.Exit(1)
 	}
 
-	wsURL, err := buildConsoleURL(*baseURL, *machineID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid url: %v\n", err)
-		os.Exit(1)
-	}
-
-	origin := deriveOrigin(wsURL)
-	conn, err := websocket.Dial(wsURL, "", origin)
+	conn, err := dialConsole(*baseURL, *machineID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "connect failed: %v\n", err)
 		os.Exit(1)
@@ -125,58 +121,120 @@ func controlPlaneConsole(args []string) {
 	errCh := make(chan error, 2)
 
 	go func() {
-		_, err := io.Copy(conn, os.Stdin)
-		errCh <- err
+		_, copyErr := io.Copy(conn, os.Stdin)
+		errCh <- copyErr
 	}()
 
 	go func() {
-		_, err := io.Copy(os.Stdout, conn)
-		errCh <- err
+		_, copyErr := io.Copy(os.Stdout, conn)
+		errCh <- copyErr
 	}()
 
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
-		if err != nil && err != io.EOF {
+		if err != nil && !errors.Is(err, io.EOF) {
 			fmt.Fprintf(os.Stderr, "console error: %v\n", err)
 		}
 	}
 }
 
-func buildConsoleURL(base, machineID string) (string, error) {
+func dialConsole(base, machineID string) (net.Conn, error) {
 	parsed, err := url.Parse(base)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	switch parsed.Scheme {
-	case "http":
-		parsed.Scheme = "ws"
-	case "https":
-		parsed.Scheme = "wss"
-	case "ws", "wss":
-	case "":
-		parsed.Scheme = "ws"
-	default:
-		return "", fmt.Errorf("unsupported scheme %s", parsed.Scheme)
+	if parsed.Scheme == "" {
+		parsed.Scheme = "http"
 	}
 
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/ConsoleMergenVM/" + machineID
-	return parsed.String(), nil
+	if parsed.Scheme != "http" {
+		return nil, fmt.Errorf("unsupported scheme %s", parsed.Scheme)
+	}
+
+	host := parsed.Host
+	if host == "" {
+		host = parsed.Path
+		parsed.Path = ""
+	}
+	if host == "" {
+		host = "127.0.0.1:1323"
+	}
+
+	if !strings.Contains(host, ":") {
+		host = net.JoinHostPort(host, "80")
+	}
+
+	path := strings.TrimRight(parsed.Path, "/") + "/ConsoleMergenVM/" + machineID
+	if path == "" {
+		path = "/"
+	}
+
+	tcpConn, err := net.Dial("tcp", host)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := sendConsoleUpgrade(tcpConn, host, path); err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+
+	buffered := bufio.NewReader(tcpConn)
+	if err := readUpgradeResponse(buffered); err != nil {
+		tcpConn.Close()
+		return nil, err
+	}
+
+	return &bufferedConn{Conn: tcpConn, reader: buffered}, nil
 }
 
-func deriveOrigin(wsURL string) string {
-	parsed, err := url.Parse(wsURL)
+func sendConsoleUpgrade(conn net.Conn, host, path string) error {
+	request := fmt.Sprintf("GET %s HTTP/1.1\r\n", path)
+	if _, err := io.WriteString(conn, request); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(conn, fmt.Sprintf("Host: %s\r\n", strings.TrimPrefix(host, "//"))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(conn, "Upgrade: mergen-console\r\n"); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(conn, "Connection: Upgrade\r\n\r\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func readUpgradeResponse(reader *bufio.Reader) error {
+	statusLine, err := reader.ReadString('\n')
 	if err != nil {
-		return wsURL
+		return err
 	}
-	switch parsed.Scheme {
-	case "ws":
-		parsed.Scheme = "http"
-	case "wss":
-		parsed.Scheme = "https"
+	if !strings.Contains(statusLine, " 101 ") {
+		return fmt.Errorf("unexpected response: %s", strings.TrimSpace(statusLine))
 	}
-	return parsed.String()
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	return nil
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
 }
 
 func runProxy(args []string) {
