@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/signal"
@@ -57,8 +58,11 @@ func runControlPlane(args []string) {
 		controlPlaneServe(args[1:])
 	case "console":
 		controlPlaneConsole(args[1:])
+	case "console":
+		controlPlaneConsole(args[1:])
 	case "help", "-h", "--help":
 		fmt.Fprintf(os.Stderr, "usage: mergencli control-plane serve [--listen addr]\n")
+		fmt.Fprintf(os.Stderr, "       mergencli control-plane console --id machine-id [--url http://127.0.0.1:1323]\n")
 		fmt.Fprintf(os.Stderr, "       mergencli control-plane console --id machine-id [--url http://127.0.0.1:1323]\n")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown control-plane subcommand: %s\n", sub)
@@ -117,13 +121,27 @@ func controlPlaneConsole(args []string) {
 	}
 	defer conn.Close()
 
-	for {
-		var data []byte
-		if err := websocket.Message.Receive(conn, &data); err != nil {
-			fmt.Fprintf(os.Stderr, "connection closed: %v\n", err)
-			return
+	ctx, cancel := signalContext()
+	defer cancel()
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		_, err := io.Copy(conn, os.Stdin)
+		errCh <- err
+	}()
+
+	go func() {
+		_, err := io.Copy(os.Stdout, conn)
+		errCh <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+	case err := <-errCh:
+		if err != nil && err != io.EOF {
+			fmt.Fprintf(os.Stderr, "console error: %v\n", err)
 		}
-		os.Stdout.Write(data)
 	}
 }
 
@@ -145,7 +163,7 @@ func buildConsoleURL(base, machineID string) (string, error) {
 		return "", fmt.Errorf("unsupported scheme %s", parsed.Scheme)
 	}
 
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/machines/" + machineID + "/console"
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/ConsoleMergenVM/" + machineID
 	return parsed.String(), nil
 }
 
