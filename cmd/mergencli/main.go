@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/alperreha/mergen/internal/controlplane"
 	"github.com/alperreha/mergen/internal/proxy"
+	"golang.org/x/net/websocket"
 )
 
 func main() {
@@ -53,8 +55,11 @@ func runControlPlane(args []string) {
 	switch sub {
 	case "serve":
 		controlPlaneServe(args[1:])
+	case "console":
+		controlPlaneConsole(args[1:])
 	case "help", "-h", "--help":
 		fmt.Fprintf(os.Stderr, "usage: mergencli control-plane serve [--listen addr]\n")
+		fmt.Fprintf(os.Stderr, "       mergencli control-plane console --id machine-id [--url http://127.0.0.1:1323]\n")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown control-plane subcommand: %s\n", sub)
 		os.Exit(1)
@@ -83,6 +88,79 @@ func controlPlaneServe(args []string) {
 		fmt.Fprintf(os.Stderr, "control plane error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func controlPlaneConsole(args []string) {
+	fs := flag.NewFlagSet("control-plane console", flag.ExitOnError)
+	machineID := fs.String("id", "", "machine identifier")
+	baseURL := fs.String("url", "http://127.0.0.1:1323", "control plane base URL")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	if strings.TrimSpace(*machineID) == "" {
+		fmt.Fprintf(os.Stderr, "machine id is required\n")
+		os.Exit(1)
+	}
+
+	wsURL, err := buildConsoleURL(*baseURL, *machineID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid url: %v\n", err)
+		os.Exit(1)
+	}
+
+	origin := deriveOrigin(wsURL)
+	conn, err := websocket.Dial(wsURL, "", origin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "connect failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	for {
+		var data []byte
+		if err := websocket.Message.Receive(conn, &data); err != nil {
+			fmt.Fprintf(os.Stderr, "connection closed: %v\n", err)
+			return
+		}
+		os.Stdout.Write(data)
+	}
+}
+
+func buildConsoleURL(base, machineID string) (string, error) {
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+
+	switch parsed.Scheme {
+	case "http":
+		parsed.Scheme = "ws"
+	case "https":
+		parsed.Scheme = "wss"
+	case "ws", "wss":
+	case "":
+		parsed.Scheme = "ws"
+	default:
+		return "", fmt.Errorf("unsupported scheme %s", parsed.Scheme)
+	}
+
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/machines/" + machineID + "/console"
+	return parsed.String(), nil
+}
+
+func deriveOrigin(wsURL string) string {
+	parsed, err := url.Parse(wsURL)
+	if err != nil {
+		return wsURL
+	}
+	switch parsed.Scheme {
+	case "ws":
+		parsed.Scheme = "http"
+	case "wss":
+		parsed.Scheme = "https"
+	}
+	return parsed.String()
 }
 
 func runProxy(args []string) {
