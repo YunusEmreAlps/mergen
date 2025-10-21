@@ -60,8 +60,6 @@ func runControlPlane(args []string) {
 		controlPlaneServe(args[1:])
 	case "console":
 		controlPlaneConsole(args[1:])
-	case "console":
-		controlPlaneConsole(args[1:])
 	case "help", "-h", "--help":
 		fmt.Fprintf(os.Stderr, "usage: mergencli control-plane serve [--listen addr]\n")
 		fmt.Fprintf(os.Stderr, "       mergencli control-plane console --id machine-id [--url http://127.0.0.1:1323]\n")
