@@ -8,18 +8,19 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-func (s *Server) handleDeleteVM(c echo.Context) error {
+func (s *Server) handleStopVM(c echo.Context) error {
 	name := c.Param("name")
 	if name == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request().Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request().Context(), 60*time.Second)
 	defer cancel()
 
-	if err := s.manager.Delete(ctx, name); err != nil {
+	status, err := s.manager.Stop(ctx, name)
+	if err != nil {
 		return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 	}
 
-	return c.JSON(http.StatusOK, map[string]string{"status": "deleted"})
+	return c.JSON(http.StatusOK, status)
 }

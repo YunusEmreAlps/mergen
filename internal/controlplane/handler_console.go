@@ -25,7 +25,7 @@ func (c *hijackedConn) Write(p []byte) (int, error) {
 	return c.Conn.Write(p)
 }
 
-func (s *Server) handleConsoleMergenVM(c echo.Context) error {
+func (s *Server) handleConsoleVM(c echo.Context) error {
 	id := c.Param("id")
 	request := c.Request()
 
