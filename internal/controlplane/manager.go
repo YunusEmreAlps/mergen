@@ -11,385 +11,490 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
+	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
+	"github.com/sirupsen/logrus"
 )
 
 const (
-	defaultBootArgs        = "console=ttyS0 reboot=k panic=1 pci=off"
-	defaultStateDirName    = "mergen"
-	defaultSocketDirName   = "sockets"
-	defaultLogDirName      = "logs"
-	defaultFirecrackerBin  = "firecracker"
-	socketReadyWaitTimeout = 60 * time.Second
+	defaultBootArgs    = "console=ttyS0 reboot=k panic=1 pci=off"
+	kernelFileName     = "vmlinux.bin"
+	rootfsFileName     = "rootfs.ext4"
+	defaultFirecracker = "firecracker"
+	defaultStateName   = "state.json"
+	defaultVolumesDir  = "volumes"
+	defaultImagesDir   = "images"
+	defaultLogsDir     = "logs"
+	logFifoName        = "firecracker.log.fifo"
+	metricsFifoName    = "firecracker.metrics.fifo"
+	socketFileName     = "firecracker.sock"
 )
 
-type MachineRequest struct {
-	ID                string `json:"id"`
-	KernelImagePath   string `json:"kernel_image_path"`
-	RootDrivePath     string `json:"root_drive_path"`
-	CPUCount          int64  `json:"cpu_count"`
-	MemSizeMb         int64  `json:"mem_size_mb"`
-	BootArgs          string `json:"boot_args"`
-	SocketPath        string `json:"socket_path"`
-	LogDir            string `json:"log_dir"`
-	FirecrackerBinary string `json:"firecracker_binary"`
+type MachineSpec struct {
+	CPUCount  int64 `json:"cpu_count"`
+	MemSizeMb int64 `json:"mem_size_mb"`
 }
 
 type MachineStatus struct {
 	ID         string    `json:"id"`
 	Status     string    `json:"status"`
 	SocketPath string    `json:"socket_path"`
-	LogPath    string    `json:"log_path"`
+	VolumePath string    `json:"volume_path"`
 	CreatedAt  time.Time `json:"created_at"`
-	PID        int       `json:"pid"`
-	ExitError  string    `json:"exit_error,omitempty"`
 }
 
-type MachineRecord struct {
-	id         string
-	cmd        *exec.Cmd
-	socketPath string
-	logPath    string
-	status     string
-	createdAt  time.Time
-	pid        int
-	exitErr    error
-	exitCh     chan struct{}
+type machineRecord struct {
+	id          string
+	machine     *firecracker.Machine
+	status      string
+	createdAt   time.Time
+	socketPath  string
+	volumePath  string
+	logFifo     string
+	metricsFifo string
+	monitorCh   chan error
+	logFile     *os.File
+}
+
+type persistedMachine struct {
+	ID          string    `json:"id"`
+	Status      string    `json:"status"`
+	SocketPath  string    `json:"socket_path"`
+	VolumePath  string    `json:"volume_path"`
+	LogFifo     string    `json:"log_fifo"`
+	MetricsFifo string    `json:"metrics_fifo"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type stateFile struct {
+	Machines map[string]persistedMachine `json:"machines"`
 }
 
 type MachineManager struct {
-	mu          sync.RWMutex
-	machines    map[string]*MachineRecord
-	socketDir   string
-	logDir      string
-	defaultBoot string
-	fcBinary    string
+	mu         sync.RWMutex
+	machines   map[string]*machineRecord
+	bootArgs   string
+	fcBinary   string
+	imagesDir  string
+	volumesDir string
+	logsDir    string
+	statePath  string
 }
 
 func NewMachineManager() (*MachineManager, error) {
-	stateDir := os.Getenv("MERGEN_STATE_DIR")
-	if stateDir == "" {
-		stateDir = filepath.Join(os.TempDir(), defaultStateDirName)
+	projectDir := os.Getenv("PROJECT_PWD")
+	if projectDir == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("determine project directory: %w", err)
+		}
+		projectDir = wd
 	}
-	socketDir := filepath.Join(stateDir, defaultSocketDirName)
-	logDir := filepath.Join(stateDir, defaultLogDirName)
 
-	for _, dir := range []string{stateDir, socketDir, logDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("create state dir %s: %w", dir, err)
+	imagesDir := filepath.Join(projectDir, defaultImagesDir)
+	volumesDir := filepath.Join(projectDir, defaultVolumesDir)
+	logsDir := filepath.Join(projectDir, defaultLogsDir)
+	if err := os.MkdirAll(volumesDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create volumes dir: %w", err)
+	}
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create logs dir: %w", err)
+	}
+
+	statePath := filepath.Join(projectDir, defaultStateName)
+
+	fcBinary := os.Getenv("MERGEN_FIRECRACKER_BIN")
+	if fcBinary == "" {
+		fcBinary = os.Getenv("FIRECRACKER_BINARY")
+	}
+	if fcBinary == "" {
+		fcBinary = defaultFirecracker
+	}
+
+	mgr := &MachineManager{
+		machines:   make(map[string]*machineRecord),
+		bootArgs:   defaultBootArgs,
+		fcBinary:   fcBinary,
+		imagesDir:  imagesDir,
+		volumesDir: volumesDir,
+		logsDir:    logsDir,
+		statePath:  statePath,
+	}
+
+	if err := mgr.loadState(); err != nil {
+		return nil, err
+	}
+
+	return mgr, nil
+}
+
+func (m *MachineManager) loadState() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	data, err := os.ReadFile(m.statePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read state file: %w", err)
+	}
+
+	var state stateFile
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("parse state file: %w", err)
+	}
+
+	for id, persisted := range state.Machines {
+		rec := &machineRecord{
+			id:          id,
+			status:      persisted.Status,
+			createdAt:   persisted.CreatedAt,
+			socketPath:  persisted.SocketPath,
+			volumePath:  persisted.VolumePath,
+			logFifo:     persisted.LogFifo,
+			metricsFifo: persisted.MetricsFifo,
+			monitorCh:   make(chan error, 1),
+		}
+		m.machines[id] = rec
+	}
+	return nil
+}
+
+func (m *MachineManager) saveStateLocked() error {
+	state := stateFile{Machines: make(map[string]persistedMachine, len(m.machines))}
+	for id, rec := range m.machines {
+		state.Machines[id] = persistedMachine{
+			ID:          id,
+			Status:      rec.status,
+			SocketPath:  rec.socketPath,
+			VolumePath:  rec.volumePath,
+			LogFifo:     rec.logFifo,
+			MetricsFifo: rec.metricsFifo,
+			CreatedAt:   rec.createdAt,
 		}
 	}
 
-	binary := os.Getenv("MERGEN_FIRECRACKER_BIN")
-	if binary == "" {
-		binary = os.Getenv("FIRECRACKER_BINARY")
+	tmpPath := m.statePath + ".tmp"
+	buf, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode state: %w", err)
 	}
-	if binary == "" {
-		binary = defaultFirecrackerBin
+	if err := os.WriteFile(tmpPath, buf, 0o644); err != nil {
+		return fmt.Errorf("write state temp file: %w", err)
 	}
-
-	return &MachineManager{
-		machines:    make(map[string]*MachineRecord),
-		socketDir:   socketDir,
-		logDir:      logDir,
-		defaultBoot: defaultBootArgs,
-		fcBinary:    binary,
-	}, nil
+	if err := os.Rename(tmpPath, m.statePath); err != nil {
+		return fmt.Errorf("commit state file: %w", err)
+	}
+	return nil
 }
 
-func (m *MachineManager) CreateAndStart(ctx context.Context, req MachineRequest) (*MachineStatus, error) {
-	if req.ID == "" {
+func (m *MachineManager) Create(ctx context.Context, id string, spec MachineSpec) (*MachineStatus, error) {
+	if strings.TrimSpace(id) == "" {
 		return nil, errors.New("id is required")
 	}
-	if req.KernelImagePath == "" {
-		return nil, errors.New("kernel_image_path is required")
+	if spec.CPUCount <= 0 {
+		spec.CPUCount = 1
 	}
-	if req.RootDrivePath == "" {
-		return nil, errors.New("root_drive_path is required")
-	}
-	if _, err := os.Stat(req.KernelImagePath); err != nil {
-		return nil, fmt.Errorf("kernel image: %w", err)
-	}
-	if _, err := os.Stat(req.RootDrivePath); err != nil {
-		return nil, fmt.Errorf("root drive: %w", err)
+	if spec.MemSizeMb <= 0 {
+		spec.MemSizeMb = 512
 	}
 
-	if req.CPUCount <= 0 {
-		req.CPUCount = 1
-	}
-	if req.MemSizeMb <= 0 {
-		req.MemSizeMb = 512
+	sanitized := sanitizeResourceID(id)
+	if sanitized == "" {
+		sanitized = "vm"
 	}
 
 	m.mu.Lock()
-	if _, exists := m.machines[req.ID]; exists {
+	if _, exists := m.machines[id]; exists {
 		m.mu.Unlock()
-		return nil, fmt.Errorf("machine %s already exists", req.ID)
+		return nil, fmt.Errorf("machine %s already exists", id)
 	}
 	m.mu.Unlock()
 
-	sanitizedID := sanitizeResourceID(req.ID)
-	if sanitizedID == "" {
-		sanitizedID = "machine"
+	kernelSrc := filepath.Join(m.imagesDir, kernelFileName)
+	rootfsSrc := filepath.Join(m.imagesDir, rootfsFileName)
+	if _, err := os.Stat(kernelSrc); err != nil {
+		return nil, fmt.Errorf("kernel image: %w", err)
+	}
+	if _, err := os.Stat(rootfsSrc); err != nil {
+		return nil, fmt.Errorf("rootfs image: %w", err)
 	}
 
-	socketPath := req.SocketPath
-	if socketPath == "" {
-		socketPath = filepath.Join(m.socketDir, fmt.Sprintf("firecracker.%s.socket", req.ID))
+	volumeDir := filepath.Join(m.volumesDir, id)
+	if err := os.MkdirAll(volumeDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create volume dir: %w", err)
 	}
-	if err := ensureParentDir(socketPath); err != nil {
-		return nil, fmt.Errorf("socket dir: %w", err)
+
+	kernelDst := filepath.Join(volumeDir, kernelFileName)
+	rootfsDst := filepath.Join(volumeDir, rootfsFileName)
+	if err := copyFile(kernelSrc, kernelDst); err != nil {
+		return nil, fmt.Errorf("copy kernel: %w", err)
 	}
+	if err := copyFile(rootfsSrc, rootfsDst); err != nil {
+		return nil, fmt.Errorf("copy rootfs: %w", err)
+	}
+
+	socketPath := filepath.Join(volumeDir, socketFileName)
+	logFifo := filepath.Join(volumeDir, logFifoName)
+	metricsFifo := filepath.Join(volumeDir, metricsFifoName)
 	_ = os.Remove(socketPath)
+	_ = os.Remove(logFifo)
+	_ = os.Remove(metricsFifo)
 
-	logDir := req.LogDir
-	if logDir == "" {
-		logDir = m.logDir
+	if err := makeFifo(logFifo); err != nil {
+		return nil, fmt.Errorf("create log fifo: %w", err)
 	}
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return nil, fmt.Errorf("log dir: %w", err)
+	if err := makeFifo(metricsFifo); err != nil {
+		return nil, fmt.Errorf("create metrics fifo: %w", err)
 	}
-	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", req.ID))
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+
+	logFilePath := filepath.Join(m.logsDir, fmt.Sprintf("%s.log", sanitized))
+	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open log file: %w", err)
 	}
-	defer logFile.Close()
 
-	binary := req.FirecrackerBinary
-	if binary == "" {
-		binary = m.fcBinary
+	logger := logrus.New()
+	logger.SetOutput(logFile)
+	logger.SetLevel(logrus.InfoLevel)
+
+	cfg := firecracker.Config{
+		SocketPath:      socketPath,
+		LogFifo:         logFifo,
+		MetricsFifo:     metricsFifo,
+		KernelImagePath: kernelDst,
+		KernelArgs:      m.bootArgs,
+		Drives: []models.Drive{
+			{
+				DriveID:      firecracker.String(fmt.Sprintf("rootfs_%s", sanitized)),
+				PathOnHost:   firecracker.String(rootfsDst),
+				IsRootDevice: firecracker.Bool(true),
+				IsReadOnly:   firecracker.Bool(false),
+			},
+		},
+		MachineCfg: models.MachineConfiguration{
+			VcpuCount:       firecracker.Int64(spec.CPUCount),
+			MemSizeMib:      firecracker.Int64(spec.MemSizeMb),
+			Smt:             firecracker.Bool(false),
+			TrackDirtyPages: firecracker.Bool(false),
+		},
+		VmID: sanitized,
 	}
 
-	cmd := exec.Command(binary, "--api-sock", socketPath, "--id", sanitizedID)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start firecracker: %w", err)
+	machineOpts := []firecracker.Opt{
+		firecracker.WithProcessRunner(firecracker.NewDefaultProcessRunner(m.fcBinary, logFile, logFile)),
+		firecracker.WithLogger(logrus.NewEntry(logger)),
 	}
 
-	record := &MachineRecord{
-		id:         req.ID,
-		cmd:        cmd,
-		socketPath: socketPath,
-		logPath:    logPath,
-		status:     "starting",
-		createdAt:  time.Now(),
-		pid:        cmd.Process.Pid,
-		exitCh:     make(chan struct{}),
+	machine, err := firecracker.NewMachine(ctx, cfg, machineOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("init machine: %w", err)
 	}
+
+	if err := machine.Start(ctx); err != nil {
+		return nil, fmt.Errorf("start machine: %w", err)
+	}
+
+	go streamFIFO(logFifo, logFilePath)
+	go streamFIFO(metricsFifo, "")
+
+	rec := &machineRecord{
+		id:          id,
+		machine:     machine,
+		status:      "running",
+		createdAt:   time.Now(),
+		socketPath:  socketPath,
+		volumePath:  volumeDir,
+		logFifo:     logFifo,
+		metricsFifo: metricsFifo,
+		monitorCh:   make(chan error, 1),
+		logFile:     logFile,
+	}
+
+	go m.monitorMachine(context.Background(), rec)
 
 	m.mu.Lock()
-	m.machines[req.ID] = record
+	m.machines[id] = rec
+	if err := m.saveStateLocked(); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 	m.mu.Unlock()
 
-	go m.monitorMachine(req.ID, record)
-
-	if err := waitForSocket(ctx, socketPath, socketReadyWaitTimeout); err != nil {
-		m.cleanupMachine(record)
-		return nil, fmt.Errorf("wait for socket: %w", err)
-	}
-
-	client := newFirecrackerClient(socketPath)
-	bootArgs := req.BootArgs
-	if bootArgs == "" {
-		bootArgs = m.defaultBoot
-	}
-
-	if err := client.putMachineConfig(ctx, machineConfigRequest{
-		VcpuCount:   req.CPUCount,
-		MemSizeMiB:  req.MemSizeMb,
-		SMT:         false,
-		TrackDirty:  false,
-		CpuTemplate: "None",
-	}); err != nil {
-		m.cleanupMachine(record)
-		return nil, fmt.Errorf("machine-config: %w", err)
-	}
-
-	if err := client.putBootSource(ctx, bootSourceRequest{
-		KernelImagePath: req.KernelImagePath,
-		BootArgs:        bootArgs,
-	}); err != nil {
-		m.cleanupMachine(record)
-		return nil, fmt.Errorf("boot-source: %w", err)
-	}
-
-	driveID := sanitizeResourceID(fmt.Sprintf("rootfs_%s", req.ID))
-	if driveID == "" {
-		driveID = "rootfs"
-	}
-	if err := client.putDrive(ctx, driveID, driveRequest{
-		DriveID:      driveID,
-		PathOnHost:   req.RootDrivePath,
-		IsRootDevice: true,
-		IsReadOnly:   false,
-	}); err != nil {
-		m.cleanupMachine(record)
-		return nil, fmt.Errorf("drive: %w", err)
-	}
-
-	if err := client.instanceAction(ctx, actionRequest{ActionType: "InstanceStart"}); err != nil {
-		m.cleanupMachine(record)
-		return nil, fmt.Errorf("start instance: %w", err)
-	}
-
-	record.status = "running"
-
 	status := &MachineStatus{
-		ID:         req.ID,
-		Status:     record.status,
-		SocketPath: socketPath,
-		LogPath:    logPath,
-		CreatedAt:  record.createdAt,
-		PID:        record.pid,
+		ID:         id,
+		Status:     rec.status,
+		SocketPath: rec.socketPath,
+		VolumePath: rec.volumePath,
+		CreatedAt:  rec.createdAt,
 	}
 	return status, nil
 }
 
-func (m *MachineManager) cleanupMachine(record *MachineRecord) {
-	terminateProcess(record.cmd.Process)
-	record.cmd.Wait()
-	_ = os.Remove(record.socketPath)
-	_ = os.Remove(record.logPath)
-
-	m.mu.Lock()
-	delete(m.machines, record.id)
-	m.mu.Unlock()
-}
-
-func (m *MachineManager) DialConsole(ctx context.Context, id string) (net.Conn, error) {
+func (m *MachineManager) Stop(ctx context.Context, id string) (*MachineStatus, error) {
 	m.mu.RLock()
-	record, ok := m.machines[id]
+	rec, ok := m.machines[id]
 	m.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("machine %s not found", id)
 	}
-	d := net.Dialer{}
-	return d.DialContext(ctx, "unix", record.socketPath)
-}
 
-func (m *MachineManager) monitorMachine(id string, record *MachineRecord) {
-	err := record.cmd.Wait()
-	m.mu.Lock()
-	if existing, ok := m.machines[id]; ok && existing == record {
-		record.exitErr = err
-		if err != nil {
-			record.status = "error"
-			log.Printf("machine %s exited with error: %v", id, err)
-		} else {
-			record.status = "stopped"
-			log.Printf("machine %s exited", id)
+	client := newFirecrackerClient(rec.socketPath)
+	if err := client.instanceAction(ctx, actionRequest{ActionType: "InstanceStop"}); err != nil {
+		log.Printf("stop request failed for %s: %v", id, err)
+	}
+
+	if rec.machine != nil {
+		stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := rec.machine.Shutdown(stopCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("machine %s shutdown error: %v", id, err)
 		}
-		record.pid = 0
-	}
-	m.mu.Unlock()
-	close(record.exitCh)
-}
-
-func (m *MachineManager) Status(ctx context.Context, id string) (*MachineStatus, error) {
-	m.mu.RLock()
-	record, ok := m.machines[id]
-	if !ok {
-		m.mu.RUnlock()
-		return nil, fmt.Errorf("machine %s not found", id)
-	}
-	status := record.status
-	socketPath := record.socketPath
-	logPath := record.logPath
-	createdAt := record.createdAt
-	pid := record.pid
-	exitErr := record.exitErr
-	m.mu.RUnlock()
-
-	client := newFirecrackerClient(socketPath)
-	if info, err := client.instanceInfo(ctx); err == nil {
-		status = info.State
-		pid = info.PID
-	}
-
-	result := &MachineStatus{
-		ID:         id,
-		Status:     status,
-		SocketPath: socketPath,
-		LogPath:    logPath,
-		CreatedAt:  createdAt,
-		PID:        pid,
-	}
-	if exitErr != nil {
-		result.ExitError = exitErr.Error()
-	}
-	return result, nil
-}
-
-func (m *MachineManager) Delete(ctx context.Context, id string) error {
-	m.mu.RLock()
-	record, ok := m.machines[id]
-	m.mu.RUnlock()
-	if !ok {
-		return fmt.Errorf("machine %s not found", id)
-	}
-
-	client := newFirecrackerClient(record.socketPath)
-	stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := client.instanceAction(stopCtx, actionRequest{ActionType: "InstanceStop"}); err != nil {
-		log.Printf("machine %s stop failed: %v", id, err)
 	}
 
 	select {
-	case <-record.exitCh:
+	case <-rec.monitorCh:
 	case <-time.After(5 * time.Second):
-		_ = terminateProcess(record.cmd.Process)
-		select {
-		case <-record.exitCh:
-		case <-time.After(3 * time.Second):
-		}
 	}
 
-	_ = os.Remove(record.socketPath)
-	_ = os.Remove(record.logPath)
-
 	m.mu.Lock()
-	delete(m.machines, id)
+	rec.status = "stopped"
+	if err := m.saveStateLocked(); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
 	m.mu.Unlock()
 
+	status := &MachineStatus{
+		ID:         id,
+		Status:     rec.status,
+		SocketPath: rec.socketPath,
+		VolumePath: rec.volumePath,
+		CreatedAt:  rec.createdAt,
+	}
+	return status, nil
+}
+
+func (m *MachineManager) Delete(ctx context.Context, id string) error {
+	status, err := m.Stop(ctx, id)
+	if err != nil && !strings.Contains(err.Error(), "not found") {
+		return err
+	}
+	_ = status
+
+	m.mu.Lock()
+	rec, ok := m.machines[id]
+	if ok {
+		delete(m.machines, id)
+	}
+	if err := m.saveStateLocked(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	m.mu.Unlock()
+
+	if ok {
+		_ = os.Remove(rec.socketPath)
+		_ = os.Remove(rec.logFifo)
+		_ = os.Remove(rec.metricsFifo)
+		if rec.volumePath != "" {
+			_ = os.RemoveAll(rec.volumePath)
+		}
+	}
 	return nil
 }
 
-type machineConfigRequest struct {
-	VcpuCount   int64  `json:"vcpu_count"`
-	MemSizeMiB  int64  `json:"mem_size_mib"`
-	SMT         bool   `json:"smt"`
-	TrackDirty  bool   `json:"track_dirty_pages"`
-	CpuTemplate string `json:"cpu_template"`
+func (m *MachineManager) monitorMachine(ctx context.Context, rec *machineRecord) {
+	if rec.machine == nil {
+		return
+	}
+	err := rec.machine.Wait(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("machine %s exited with error: %v", rec.id, err)
+	}
+	rec.monitorCh <- err
+	close(rec.monitorCh)
+	if rec.logFile != nil {
+		_ = rec.logFile.Close()
+	}
+
+	m.mu.Lock()
+	if existing, ok := m.machines[rec.id]; ok && existing == rec {
+		if err != nil {
+			rec.status = "error"
+		} else {
+			rec.status = "stopped"
+		}
+		_ = m.saveStateLocked()
+	}
+	m.mu.Unlock()
 }
 
-type bootSourceRequest struct {
-	KernelImagePath string `json:"kernel_image_path"`
-	BootArgs        string `json:"boot_args,omitempty"`
+func makeFifo(path string) error {
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
-type driveRequest struct {
-	DriveID      string `json:"drive_id"`
-	PathOnHost   string `json:"path_on_host"`
-	IsRootDevice bool   `json:"is_root_device"`
-	IsReadOnly   bool   `json:"is_read_only"`
+func streamFIFO(path, logPath string) {
+	file, err := os.OpenFile(path, os.O_RDONLY, 0o600)
+	if err != nil {
+		log.Printf("open fifo %s failed: %v", path, err)
+		return
+	}
+	defer file.Close()
+
+	var writer io.Writer
+	if logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			log.Printf("open log file %s failed: %v", logPath, err)
+			writer = io.Discard
+		} else {
+			defer f.Close()
+			writer = f
+		}
+	} else {
+		writer = io.Discard
+	}
+
+	if _, err := io.Copy(writer, file); err != nil {
+		log.Printf("copy fifo %s failed: %v", path, err)
+	}
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
 }
 
 type actionRequest struct {
 	ActionType string `json:"action_type"`
-}
-
-type instanceInfoResponse struct {
-	State string `json:"state"`
-	PID   int    `json:"pid"`
 }
 
 type firecrackerClient struct {
@@ -406,46 +511,8 @@ func newFirecrackerClient(socketPath string) *firecrackerClient {
 	return &firecrackerClient{httpClient: &http.Client{Transport: transport, Timeout: 5 * time.Second}}
 }
 
-func (c *firecrackerClient) putMachineConfig(ctx context.Context, payload machineConfigRequest) error {
-	return c.do(ctx, http.MethodPut, "/machine-config", payload)
-}
-
-func (c *firecrackerClient) putBootSource(ctx context.Context, payload bootSourceRequest) error {
-	return c.do(ctx, http.MethodPut, "/boot-source", payload)
-}
-
-func (c *firecrackerClient) putDrive(ctx context.Context, driveID string, payload driveRequest) error {
-	path := fmt.Sprintf("/drives/%s", driveID)
-	return c.do(ctx, http.MethodPut, path, payload)
-}
-
 func (c *firecrackerClient) instanceAction(ctx context.Context, payload actionRequest) error {
 	return c.do(ctx, http.MethodPut, "/actions", payload)
-}
-
-func (c *firecrackerClient) instanceInfo(ctx context.Context) (*instanceInfoResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/instance-info", nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return nil, fmt.Errorf("instance-info failed: %s", string(body))
-	}
-
-	var out instanceInfoResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-
-	return &out, nil
 }
 
 func (c *firecrackerClient) do(ctx context.Context, method, path string, payload any) error {
@@ -501,41 +568,4 @@ func sanitizeResourceID(id string) string {
 		}
 	}
 	return string(buf)
-}
-
-func ensureParentDir(path string) error {
-	dir := filepath.Dir(path)
-	return os.MkdirAll(dir, 0o755)
-}
-
-func waitForSocket(ctx context.Context, socketPath string, timeout time.Duration) error {
-	deadline := time.NewTimer(timeout)
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer deadline.Stop()
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return errors.New("timeout waiting for socket")
-		case <-ticker.C:
-			if _, err := os.Stat(socketPath); err == nil {
-				return nil
-			}
-		}
-	}
-}
-
-func terminateProcess(proc *os.Process) error {
-	if proc == nil {
-		return nil
-	}
-	if err := syscall.Kill(-proc.Pid, syscall.SIGTERM); err != nil {
-		if !errors.Is(err, os.ErrProcessDone) && err != syscall.ESRCH {
-			return err
-		}
-	}
-	return nil
 }

@@ -26,9 +26,10 @@ func NewServer(manager *MachineManager) *Server {
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	e.POST("/CreateMergenVM", srv.handleCreateMergenVM)
-	e.POST("/DeleteMergenVM", srv.handleDeleteMergenVM)
-	e.GET("/ConsoleMergenVM/:id", srv.handleConsoleMergenVM)
+	e.POST("/create/:name", srv.handleCreateVM)
+	e.POST("/stop/:name", srv.handleStopVM)
+	e.DELETE("/delete/:name", srv.handleDeleteVM)
+	e.GET("/console/:id", srv.handleConsoleVM)
 
 	return srv
 }

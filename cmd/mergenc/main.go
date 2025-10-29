@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -33,6 +36,16 @@ func main() {
 		runControlPlane(args)
 	case "proxy":
 		runProxy(args)
+	case "serve":
+		controlPlaneServe(args)
+	case "create":
+		runCreate(args)
+	case "stop":
+		runStop(args)
+	case "delete":
+		runDelete(args)
+	case "console":
+		runConsole(args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -43,9 +56,14 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "mergencli commands:\n")
-	fmt.Fprintf(os.Stderr, "  control-plane serve [flags]\n")
+	fmt.Fprintf(os.Stderr, "mergenc commands:\n")
+	fmt.Fprintf(os.Stderr, "  serve [--listen addr]\n")
+	fmt.Fprintf(os.Stderr, "  create [--url addr] [--cpus N] [--memory MB] name\n")
+	fmt.Fprintf(os.Stderr, "  stop [--url addr] name\n")
+	fmt.Fprintf(os.Stderr, "  delete [--url addr] name\n")
+	fmt.Fprintf(os.Stderr, "  console --id name [--url addr]\n")
 	fmt.Fprintf(os.Stderr, "  proxy serve [flags]\n")
+	fmt.Fprintf(os.Stderr, "  control-plane serve|console ... (legacy)\n")
 }
 
 func runControlPlane(args []string) {
@@ -61,12 +79,97 @@ func runControlPlane(args []string) {
 	case "console":
 		controlPlaneConsole(args[1:])
 	case "help", "-h", "--help":
-		fmt.Fprintf(os.Stderr, "usage: mergencli control-plane serve [--listen addr]\n")
-		fmt.Fprintf(os.Stderr, "       mergencli control-plane console --id machine-id [--url http://127.0.0.1:1323]\n")
+		fmt.Fprintf(os.Stderr, "usage: mergenc control-plane serve [--listen addr]\n")
+		fmt.Fprintf(os.Stderr, "       mergenc control-plane console --id machine-id [--url http://127.0.0.1:1323]\n")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown control-plane subcommand: %s\n", sub)
 		os.Exit(1)
 	}
+}
+
+func runCreate(args []string) {
+	fs := flag.NewFlagSet("create", flag.ExitOnError)
+	baseURL := fs.String("url", "http://127.0.0.1:1323", "control plane base URL")
+	cpus := fs.Int("cpus", 1, "number of virtual CPUs")
+	memory := fs.Int("memory", 512, "memory size in MB")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintf(os.Stderr, "usage: mergenc create [--url addr] [--cpus N] [--memory MB] name\n")
+		os.Exit(1)
+	}
+
+	name := fs.Arg(0)
+	payload := map[string]int64{
+		"cpu_count":   int64(*cpus),
+		"mem_size_mb": int64(*memory),
+	}
+
+	ctx, cancel := signalContext()
+	defer cancel()
+
+	var status controlplane.MachineStatus
+	if err := performRequest(ctx, http.MethodPost, *baseURL, fmt.Sprintf("/create/%s", name), payload, &status); err != nil {
+		fmt.Fprintf(os.Stderr, "create failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stdout, "machine %s status: %s\n", status.ID, status.Status)
+}
+
+func runStop(args []string) {
+	fs := flag.NewFlagSet("stop", flag.ExitOnError)
+	baseURL := fs.String("url", "http://127.0.0.1:1323", "control plane base URL")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintf(os.Stderr, "usage: mergenc stop [--url addr] name\n")
+		os.Exit(1)
+	}
+
+	ctx, cancel := signalContext()
+	defer cancel()
+
+	name := fs.Arg(0)
+	var status controlplane.MachineStatus
+	if err := performRequest(ctx, http.MethodPost, *baseURL, fmt.Sprintf("/stop/%s", name), nil, &status); err != nil {
+		fmt.Fprintf(os.Stderr, "stop failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stdout, "machine %s status: %s\n", status.ID, status.Status)
+}
+
+func runDelete(args []string) {
+	fs := flag.NewFlagSet("delete", flag.ExitOnError)
+	baseURL := fs.String("url", "http://127.0.0.1:1323", "control plane base URL")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintf(os.Stderr, "usage: mergenc delete [--url addr] name\n")
+		os.Exit(1)
+	}
+
+	ctx, cancel := signalContext()
+	defer cancel()
+
+	name := fs.Arg(0)
+	if err := performRequest(ctx, http.MethodDelete, *baseURL, fmt.Sprintf("/delete/%s", name), nil, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "delete failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Fprintf(os.Stdout, "machine %s deleted\n", name)
+}
+
+func runConsole(args []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		args = append([]string{"--id", args[0]}, args[1:]...)
+	}
+	controlPlaneConsole(args)
 }
 
 func controlPlaneServe(args []string) {
@@ -164,7 +267,7 @@ func dialConsole(base, machineID string) (net.Conn, error) {
 		host = net.JoinHostPort(host, "80")
 	}
 
-	path := strings.TrimRight(parsed.Path, "/") + "/ConsoleMergenVM/" + machineID
+	path := strings.TrimRight(parsed.Path, "/") + "/console/" + machineID
 	if path == "" {
 		path = "/"
 	}
@@ -246,7 +349,7 @@ func runProxy(args []string) {
 	case "serve":
 		proxyServe(args[1:])
 	case "help", "-h", "--help":
-		fmt.Fprintf(os.Stderr, "usage: mergencli proxy serve [--config path] [--listen addr] [--control-plane-url url]\n")
+		fmt.Fprintf(os.Stderr, "usage: mergenc proxy serve [--config path] [--listen addr] [--control-plane-url url]\n")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown proxy subcommand: %s\n", sub)
 		os.Exit(1)
@@ -288,6 +391,55 @@ func proxyServe(args []string) {
 		fmt.Fprintf(os.Stderr, "proxy error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func performRequest(ctx context.Context, method, baseURL, path string, payload any, out any) error {
+	trimmed := strings.TrimRight(baseURL, "/")
+	if trimmed == "" {
+		trimmed = "http://127.0.0.1:1323"
+	}
+	fullURL := trimmed + path
+
+	var body io.Reader
+	if payload != nil {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		body = bytes.NewReader(data)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
+	if err != nil {
+		return err
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		if len(data) == 0 {
+			return fmt.Errorf("request failed with status %d", resp.StatusCode)
+		}
+		return fmt.Errorf("request failed: %s", strings.TrimSpace(string(data)))
+	}
+
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return err
+		}
+	} else {
+		io.Copy(io.Discard, resp.Body)
+	}
+	return nil
 }
 
 func signalContext() (context.Context, context.CancelFunc) {
