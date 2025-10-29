@@ -1,17 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -44,8 +40,6 @@ func main() {
 		runStop(args)
 	case "delete":
 		runDelete(args)
-	case "console":
-		runConsole(args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -61,9 +55,8 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "  create [--url addr] [--cpus N] [--memory MB] name\n")
 	fmt.Fprintf(os.Stderr, "  stop [--url addr] name\n")
 	fmt.Fprintf(os.Stderr, "  delete [--url addr] name\n")
-	fmt.Fprintf(os.Stderr, "  console --id name [--url addr]\n")
 	fmt.Fprintf(os.Stderr, "  proxy serve [flags]\n")
-	fmt.Fprintf(os.Stderr, "  control-plane serve|console ... (legacy)\n")
+	fmt.Fprintf(os.Stderr, "  control-plane serve ... (legacy)\n")
 }
 
 func runControlPlane(args []string) {
@@ -76,11 +69,8 @@ func runControlPlane(args []string) {
 	switch sub {
 	case "serve":
 		controlPlaneServe(args[1:])
-	case "console":
-		controlPlaneConsole(args[1:])
 	case "help", "-h", "--help":
 		fmt.Fprintf(os.Stderr, "usage: mergenc control-plane serve [--listen addr]\n")
-		fmt.Fprintf(os.Stderr, "       mergenc control-plane console --id machine-id [--url http://127.0.0.1:1323]\n")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown control-plane subcommand: %s\n", sub)
 		os.Exit(1)
@@ -165,13 +155,6 @@ func runDelete(args []string) {
 	fmt.Fprintf(os.Stdout, "machine %s deleted\n", name)
 }
 
-func runConsole(args []string) {
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		args = append([]string{"--id", args[0]}, args[1:]...)
-	}
-	controlPlaneConsole(args)
-}
-
 func controlPlaneServe(args []string) {
 	fs := flag.NewFlagSet("control-plane serve", flag.ExitOnError)
 	listen := fs.String("listen", ":1323", "HTTP listen address for the control plane")
@@ -194,148 +177,6 @@ func controlPlaneServe(args []string) {
 		fmt.Fprintf(os.Stderr, "control plane error: %v\n", err)
 		os.Exit(1)
 	}
-}
-
-func controlPlaneConsole(args []string) {
-	fs := flag.NewFlagSet("control-plane console", flag.ExitOnError)
-	machineID := fs.String("id", "", "machine identifier")
-	baseURL := fs.String("url", "http://127.0.0.1:1323", "control plane base URL")
-	if err := fs.Parse(args); err != nil {
-		os.Exit(1)
-	}
-
-	if strings.TrimSpace(*machineID) == "" {
-		fmt.Fprintf(os.Stderr, "machine id is required\n")
-		os.Exit(1)
-	}
-
-	conn, err := dialConsole(*baseURL, *machineID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "connect failed: %v\n", err)
-		os.Exit(1)
-	}
-	defer conn.Close()
-
-	ctx, cancel := signalContext()
-	defer cancel()
-
-	errCh := make(chan error, 2)
-
-	go func() {
-		_, copyErr := io.Copy(conn, os.Stdin)
-		errCh <- copyErr
-	}()
-
-	go func() {
-		_, copyErr := io.Copy(os.Stdout, conn)
-		errCh <- copyErr
-	}()
-
-	select {
-	case <-ctx.Done():
-	case err := <-errCh:
-		if err != nil && !errors.Is(err, io.EOF) {
-			fmt.Fprintf(os.Stderr, "console error: %v\n", err)
-		}
-	}
-}
-
-func dialConsole(base, machineID string) (net.Conn, error) {
-	parsed, err := url.Parse(base)
-	if err != nil {
-		return nil, err
-	}
-
-	if parsed.Scheme == "" {
-		parsed.Scheme = "http"
-	}
-
-	if parsed.Scheme != "http" {
-		return nil, fmt.Errorf("unsupported scheme %s", parsed.Scheme)
-	}
-
-	host := parsed.Host
-	if host == "" {
-		host = parsed.Path
-		parsed.Path = ""
-	}
-	if host == "" {
-		host = "127.0.0.1:1323"
-	}
-
-	if !strings.Contains(host, ":") {
-		host = net.JoinHostPort(host, "80")
-	}
-
-	path := strings.TrimRight(parsed.Path, "/") + "/console/" + machineID
-	if path == "" {
-		path = "/"
-	}
-
-	tcpConn, err := net.Dial("tcp", host)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := sendConsoleUpgrade(tcpConn, host, path); err != nil {
-		tcpConn.Close()
-		return nil, err
-	}
-
-	buffered := bufio.NewReader(tcpConn)
-	if err := readUpgradeResponse(buffered); err != nil {
-		tcpConn.Close()
-		return nil, err
-	}
-
-	return &bufferedConn{Conn: tcpConn, reader: buffered}, nil
-}
-
-func sendConsoleUpgrade(conn net.Conn, host, path string) error {
-	request := fmt.Sprintf("GET %s HTTP/1.1\r\n", path)
-	if _, err := io.WriteString(conn, request); err != nil {
-		return err
-	}
-	if _, err := io.WriteString(conn, fmt.Sprintf("Host: %s\r\n", strings.TrimPrefix(host, "//"))); err != nil {
-		return err
-	}
-	if _, err := io.WriteString(conn, "Upgrade: mergen-console\r\n"); err != nil {
-		return err
-	}
-	if _, err := io.WriteString(conn, "Connection: Upgrade\r\n\r\n"); err != nil {
-		return err
-	}
-	return nil
-}
-
-func readUpgradeResponse(reader *bufio.Reader) error {
-	statusLine, err := reader.ReadString('\n')
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(statusLine, " 101 ") {
-		return fmt.Errorf("unexpected response: %s", strings.TrimSpace(statusLine))
-	}
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return err
-		}
-		if line == "\r\n" {
-			break
-		}
-	}
-	return nil
-}
-
-type bufferedConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *bufferedConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
 }
 
 func runProxy(args []string) {

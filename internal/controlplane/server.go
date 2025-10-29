@@ -29,7 +29,6 @@ func NewServer(manager *MachineManager) *Server {
 	e.POST("/create/:name", srv.handleCreateVM)
 	e.POST("/stop/:name", srv.handleStopVM)
 	e.DELETE("/delete/:name", srv.handleDeleteVM)
-	e.GET("/console/:id", srv.handleConsoleVM)
 
 	return srv
 }
