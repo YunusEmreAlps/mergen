@@ -172,7 +172,7 @@ func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, 
 
 	machineOpts := []firecracker.Opt{
 		firecracker.WithProcessRunner(firecracker.VMCommandBuilder{}.WithBin(runtime.FirecrackerBinary).Build(ctx)),
-		firecracker.WithLogger(logrus.NewEntry(logger)),
+		// firecracker.WithLogger(logrus.NewEntry(logger)),
 	}
 
 	machine, err := firecracker.NewMachine(ctx, cfg, machineOpts...)
@@ -184,8 +184,8 @@ func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, 
 		return nil, fmt.Errorf("start machine: %w", err)
 	}
 
-	go streamFIFO(paths.LogFifo, paths.LogFile)
-	go streamFIFO(paths.MetricsFifo, "")
+	// go streamFIFO(paths.LogFifo, paths.LogFile)
+	// go streamFIFO(paths.MetricsFifo, "")
 
 	status.State = "running"
 	status.UpdatedAt = time.Now()
@@ -210,7 +210,7 @@ func Stop(ctx context.Context, runtime Runtime, id string) (*Status, error) {
 	}
 
 	client := newFirecrackerClient(paths.SocketPath)
-	stopCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	stopCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	if err := client.instanceAction(stopCtx, actionRequest{ActionType: "InstanceStop"}); err != nil {
 		if !isNotExist(err) {
@@ -218,7 +218,7 @@ func Stop(ctx context.Context, runtime Runtime, id string) (*Status, error) {
 		}
 	}
 
-	waitCtx, cancelWait := context.WithTimeout(ctx, 10*time.Second)
+	waitCtx, cancelWait := context.WithTimeout(ctx, 60*time.Second)
 	defer cancelWait()
 	_ = waitForSocketRemoval(waitCtx, paths.SocketPath)
 
