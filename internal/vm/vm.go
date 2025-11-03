@@ -84,13 +84,6 @@ func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, 
 		_ = os.Remove(paths.MetricsFifo)
 	}
 
-	if err := makeFifo(paths.LogFifo); err != nil {
-		return nil, fmt.Errorf("create log fifo: %w", err)
-	}
-	if err := makeFifo(paths.MetricsFifo); err != nil {
-		return nil, fmt.Errorf("create metrics fifo: %w", err)
-	}
-
 	logFile, err := os.OpenFile(paths.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open log file: %w", err)
