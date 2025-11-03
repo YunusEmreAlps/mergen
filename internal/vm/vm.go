@@ -170,13 +170,15 @@ func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, 
 		}
 	}
 
-	machineOpts := []firecracker.Opt{
-		firecracker.WithProcessRunner(firecracker.VMCommandBuilder{}.WithSocketPath(paths.SocketPath).
-			WithBin(runtime.FirecrackerBinary).Build(ctx)),
-		// firecracker.WithLogger(logrus.NewEntry(logger)),
-	}
+	// machineOpts := []firecracker.Opt{
+	// 	firecracker.WithProcessRunner(firecracker.VMCommandBuilder{}.WithSocketPath(paths.SocketPath).
+	// 		WithBin(runtime.FirecrackerBinary).Build(ctx)),
+	// 	// firecracker.WithLogger(logrus.NewEntry(logger)),
+	// }
 
-	machine, err := firecracker.NewMachine(ctx, cfg, machineOpts...)
+	// machineOpts...
+
+	machine, err := firecracker.NewMachine(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("init machine: %w", err)
 	}
