@@ -171,7 +171,8 @@ func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, 
 	}
 
 	machineOpts := []firecracker.Opt{
-		firecracker.WithProcessRunner(firecracker.VMCommandBuilder{}.WithBin(runtime.FirecrackerBinary).Build(ctx)),
+		firecracker.WithProcessRunner(firecracker.VMCommandBuilder{}.WithSocketPath(paths.SocketPath).
+			WithBin(runtime.FirecrackerBinary).Build(ctx)),
 		// firecracker.WithLogger(logrus.NewEntry(logger)),
 	}
 
