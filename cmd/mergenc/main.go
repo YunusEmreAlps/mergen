@@ -1,21 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/alperreha/mergen/internal/controlplane"
-	"github.com/alperreha/mergen/internal/proxy"
+	"github.com/alperreha/mergen/internal/vm"
 )
 
 func main() {
@@ -28,12 +23,6 @@ func main() {
 	args := os.Args[2:]
 
 	switch cmd {
-	case "control-plane":
-		runControlPlane(args)
-	case "proxy":
-		runProxy(args)
-	case "serve":
-		controlPlaneServe(args)
 	case "create":
 		runCreate(args)
 	case "stop":
@@ -51,103 +40,169 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "mergenc commands:\n")
-	fmt.Fprintf(os.Stderr, "  serve [--listen addr]\n")
-	fmt.Fprintf(os.Stderr, "  create [--url addr] [--cpus N] [--memory MB] name\n")
-	fmt.Fprintf(os.Stderr, "  stop [--url addr] name\n")
-	fmt.Fprintf(os.Stderr, "  delete [--url addr] name\n")
-	fmt.Fprintf(os.Stderr, "  proxy serve [flags]\n")
-	fmt.Fprintf(os.Stderr, "  control-plane serve ... (legacy)\n")
+	fmt.Fprintf(os.Stderr, "  create [runtime flags] [--cpus N] [--memory MB] [--tap-device name] [--host-ip cidr] name\n")
+	fmt.Fprintf(os.Stderr, "  stop [runtime flags] [--timeout duration] name\n")
+	fmt.Fprintf(os.Stderr, "  delete [runtime flags] [--remove-tap] name\n")
 }
 
-func runControlPlane(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "missing subcommand for control-plane\n")
-		usage()
-		os.Exit(1)
+type runtimeFlags struct {
+	project     *string
+	images      *string
+	volumes     *string
+	logs        *string
+	kernel      *string
+	rootfs      *string
+	bootArgs    *string
+	firecracker *string
+}
+
+func addRuntimeFlags(fs *flag.FlagSet) runtimeFlags {
+	return runtimeFlags{
+		project:     fs.String("project", "", "project root containing images, volumes, and logs"),
+		images:      fs.String("images", "", "directory containing base images"),
+		volumes:     fs.String("volumes", "", "directory for per-machine volumes"),
+		logs:        fs.String("logs", "", "directory for machine logs"),
+		kernel:      fs.String("kernel", "", "path to kernel image (defaults to images/vmlinux.bin)"),
+		rootfs:      fs.String("rootfs", "", "path to rootfs image (defaults to images/rootfs.ext4)"),
+		bootArgs:    fs.String("boot-args", vm.DefaultBootArgs, "kernel boot arguments"),
+		firecracker: fs.String("firecracker-binary", "", "path to firecracker binary"),
 	}
-	sub := args[0]
-	switch sub {
-	case "serve":
-		controlPlaneServe(args[1:])
-	case "help", "-h", "--help":
-		fmt.Fprintf(os.Stderr, "usage: mergenc control-plane serve [--listen addr]\n")
-	default:
-		fmt.Fprintf(os.Stderr, "unknown control-plane subcommand: %s\n", sub)
-		os.Exit(1)
-	}
+}
+
+func runtimeFromFlags(values runtimeFlags, validateImages bool) (vm.Runtime, error) {
+	return vm.LoadRuntime(vm.RuntimeOptions{
+		ProjectDir:          *values.project,
+		ImagesDir:           *values.images,
+		VolumesDir:          *values.volumes,
+		LogsDir:             *values.logs,
+		KernelImagePath:     *values.kernel,
+		RootfsImagePath:     *values.rootfs,
+		BootArgs:            *values.bootArgs,
+		FirecrackerBinary:   *values.firecracker,
+		SkipImageValidation: !validateImages,
+	})
 }
 
 func runCreate(args []string) {
 	fs := flag.NewFlagSet("create", flag.ExitOnError)
-	baseURL := fs.String("url", "http://127.0.0.1:1323", "control plane base URL")
+	flags := addRuntimeFlags(fs)
 	cpus := fs.Int("cpus", 1, "number of virtual CPUs")
 	memory := fs.Int("memory", 512, "memory size in MB")
+	tap := fs.String("tap-device", "", "tap device to attach to the VM (default tap-<id>)")
+	hostIP := fs.String("host-ip", "172.16.0.1/30", "host address (CIDR) to assign to the tap device")
+	mac := fs.String("guest-mac", "", "MAC address to assign to the guest NIC")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
 	if fs.NArg() != 1 {
-		fmt.Fprintf(os.Stderr, "usage: mergenc create [--url addr] [--cpus N] [--memory MB] name\n")
+		fmt.Fprintf(os.Stderr, "usage: mergenc create [flags] name\n")
 		os.Exit(1)
 	}
 
 	name := fs.Arg(0)
-	payload := map[string]int64{
-		"cpu_count":   int64(*cpus),
-		"mem_size_mb": int64(*memory),
+	runtime, err := runtimeFromFlags(flags, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "runtime init failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	tapName := *tap
+	if tapName == "" {
+		tapName = fmt.Sprintf("tap-%s", vm.SanitizeID(name))
+	}
+
+	var network *vm.NetworkOptions
+	if tapName != "" {
+		network = &vm.NetworkOptions{
+			TapDevice:  tapName,
+			HostIPCIDR: *hostIP,
+			MacAddress: *mac,
+		}
 	}
 
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	var status controlplane.MachineStatus
-	if err := performRequest(ctx, http.MethodPost, *baseURL, fmt.Sprintf("/create/%s", name), payload, &status); err != nil {
+	status, err := vm.Create(ctx, runtime, vm.CreateOptions{
+		ID:      name,
+		Spec:    vm.Spec{CPUCount: int64(*cpus), MemSizeMb: int64(*memory)},
+		Network: network,
+	})
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "create failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stdout, "machine %s status: %s\n", status.ID, status.Status)
+	fmt.Fprintf(os.Stdout, "machine %s running (socket: %s)\n", status.ID, status.SocketPath)
+	if network != nil {
+		fmt.Fprintf(os.Stdout, "tap device %s host-ip=%s mac=%s\n", network.TapDevice, network.HostIPCIDR, status.MacAddress)
+	}
 }
 
 func runStop(args []string) {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
-	baseURL := fs.String("url", "http://127.0.0.1:1323", "control plane base URL")
+	flags := addRuntimeFlags(fs)
+	timeout := fs.Duration("timeout", 30*time.Second, "time to wait for shutdown")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
 	if fs.NArg() != 1 {
-		fmt.Fprintf(os.Stderr, "usage: mergenc stop [--url addr] name\n")
+		fmt.Fprintf(os.Stderr, "usage: mergenc stop [flags] name\n")
+		os.Exit(1)
+	}
+
+	name := fs.Arg(0)
+	runtime, err := runtimeFromFlags(flags, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "runtime init failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	ctx, cancel := signalContext()
 	defer cancel()
+	ctx, cancelTimeout := context.WithTimeout(ctx, *timeout)
+	defer cancelTimeout()
 
-	name := fs.Arg(0)
-	var status controlplane.MachineStatus
-	if err := performRequest(ctx, http.MethodPost, *baseURL, fmt.Sprintf("/stop/%s", name), nil, &status); err != nil {
+	status, err := vm.Stop(ctx, runtime, name)
+	if err != nil {
+		if errors.Is(err, vm.ErrNotFound) {
+			fmt.Fprintf(os.Stderr, "machine %s not found\n", name)
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "stop failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stdout, "machine %s status: %s\n", status.ID, status.Status)
+	fmt.Fprintf(os.Stdout, "machine %s status: %s\n", status.ID, status.State)
 }
 
 func runDelete(args []string) {
 	fs := flag.NewFlagSet("delete", flag.ExitOnError)
-	baseURL := fs.String("url", "http://127.0.0.1:1323", "control plane base URL")
+	flags := addRuntimeFlags(fs)
+	removeTap := fs.Bool("remove-tap", true, "delete tap device if it was created")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
 	if fs.NArg() != 1 {
-		fmt.Fprintf(os.Stderr, "usage: mergenc delete [--url addr] name\n")
+		fmt.Fprintf(os.Stderr, "usage: mergenc delete [flags] name\n")
+		os.Exit(1)
+	}
+
+	name := fs.Arg(0)
+	runtime, err := runtimeFromFlags(flags, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "runtime init failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	ctx, cancel := signalContext()
 	defer cancel()
 
-	name := fs.Arg(0)
-	if err := performRequest(ctx, http.MethodDelete, *baseURL, fmt.Sprintf("/delete/%s", name), nil, nil); err != nil {
+	if err := vm.Delete(ctx, runtime, name, *removeTap); err != nil {
+		if errors.Is(err, vm.ErrNotFound) {
+			fmt.Fprintf(os.Stderr, "machine %s not found\n", name)
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "delete failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -155,149 +210,7 @@ func runDelete(args []string) {
 	fmt.Fprintf(os.Stdout, "machine %s deleted\n", name)
 }
 
-func controlPlaneServe(args []string) {
-	fs := flag.NewFlagSet("control-plane serve", flag.ExitOnError)
-	listen := fs.String("listen", ":1323", "HTTP listen address for the control plane")
-	if err := fs.Parse(args); err != nil {
-		os.Exit(1)
-	}
-
-	manager, err := controlplane.NewMachineManager()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "control plane init failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	server := controlplane.NewServer(manager)
-
-	ctx, cancel := signalContext()
-	defer cancel()
-
-	if err := server.Serve(ctx, *listen); err != nil {
-		fmt.Fprintf(os.Stderr, "control plane error: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func runProxy(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "missing subcommand for proxy\n")
-		usage()
-		os.Exit(1)
-	}
-	sub := args[0]
-	switch sub {
-	case "serve":
-		proxyServe(args[1:])
-	case "help", "-h", "--help":
-		fmt.Fprintf(os.Stderr, "usage: mergenc proxy serve [--config path] [--listen addr] [--control-plane-url url]\n")
-	default:
-		fmt.Fprintf(os.Stderr, "unknown proxy subcommand: %s\n", sub)
-		os.Exit(1)
-	}
-}
-
-func proxyServe(args []string) {
-	fs := flag.NewFlagSet("proxy serve", flag.ExitOnError)
-	configPath := fs.String("config", "", "path to JSON proxy configuration")
-	listenOverride := fs.String("listen", "", "override listen address")
-	cpOverride := fs.String("control-plane-url", "", "override control plane base URL")
-	if err := fs.Parse(args); err != nil {
-		os.Exit(1)
-	}
-
-	cfg, err := proxy.LoadConfig(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "load proxy config failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	if *listenOverride != "" {
-		cfg.ListenAddr = *listenOverride
-	}
-	if *cpOverride != "" {
-		cfg.ControlPlaneURL = strings.TrimRight(*cpOverride, "/")
-	}
-
-	proxyServer, err := proxy.New(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "proxy init failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	ctx, cancel := signalContext()
-	defer cancel()
-
-	if err := proxyServer.Serve(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "proxy error: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func performRequest(ctx context.Context, method, baseURL, path string, payload any, out any) error {
-	trimmed := strings.TrimRight(baseURL, "/")
-	if trimmed == "" {
-		trimmed = "http://127.0.0.1:1323"
-	}
-	fullURL := trimmed + path
-
-	var body io.Reader
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		body = bytes.NewReader(data)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
-	if err != nil {
-		return err
-	}
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	client := &http.Client{Timeout: 90 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		if len(data) == 0 {
-			return fmt.Errorf("request failed with status %d", resp.StatusCode)
-		}
-		return fmt.Errorf("request failed: %s", strings.TrimSpace(string(data)))
-	}
-
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return err
-		}
-	} else {
-		io.Copy(io.Discard, resp.Body)
-	}
-	return nil
-}
-
 func signalContext() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		select {
-		case <-sigCh:
-			cancel()
-		case <-ctx.Done():
-		}
-		time.Sleep(100 * time.Millisecond)
-		signal.Stop(sigCh)
-		close(sigCh)
-	}()
-
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	return ctx, cancel
 }
