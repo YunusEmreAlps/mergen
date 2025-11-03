@@ -328,6 +328,7 @@ func makeFifo(path string) error {
 		if errors.Is(err, os.ErrExist) || 
 		   errors.Is(err, syscall.EEXIST) ||
 		   strings.Contains(strings.ToLower(err.Error()), "file exists") {
+			fmt.Println("❌ --- ", err)
 			return nil
 		}
 		return err
