@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alperreha/mergen/internal/api"
 	"github.com/alperreha/mergen/internal/vm"
 )
 
@@ -29,6 +30,8 @@ func main() {
 		runStop(args)
 	case "delete":
 		runDelete(args)
+	case "serve":
+		runServe(args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -40,6 +43,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "mergenc commands:\n")
+	fmt.Fprintf(os.Stderr, "  serve [runtime flags] [--listen addr]\n")
 	fmt.Fprintf(os.Stderr, "  create [runtime flags] [--cpus N] [--memory MB] [--tap-device name] [--host-ip cidr] name\n")
 	fmt.Fprintf(os.Stderr, "  stop [runtime flags] [--timeout duration] name\n")
 	fmt.Fprintf(os.Stderr, "  delete [runtime flags] [--remove-tap] name\n")
@@ -208,6 +212,32 @@ func runDelete(args []string) {
 	}
 
 	fmt.Fprintf(os.Stdout, "machine %s deleted\n", name)
+}
+
+func runServe(args []string) {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	flags := addRuntimeFlags(fs)
+	listen := fs.String("listen", ":1323", "address to listen for HTTP API requests")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	runtime, err := runtimeFromFlags(flags, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "runtime init failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	srv := api.NewServer(runtime)
+
+	ctx, cancel := signalContext()
+	defer cancel()
+
+	fmt.Fprintf(os.Stdout, "serving HTTP control plane on %s\n", *listen)
+	if err := srv.Serve(ctx, *listen); err != nil {
+		fmt.Fprintf(os.Stderr, "serve failed: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func signalContext() (context.Context, context.CancelFunc) {
