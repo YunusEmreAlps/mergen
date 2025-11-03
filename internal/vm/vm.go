@@ -170,18 +170,12 @@ func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, 
 		}
 	}
 
-	// Use firecracker binary when making machine
-	// TODO: update below cmd binary location because i updated it manually before.
-	binPath := os.Getenv("MERGEN_FIRECRACKER_BIN")
-	if binPath == "" {
-		binPath = filepath.Join("/usr/local/bin", "firecracker")
+	machineOpts := []firecracker.Opt{
+		firecracker.WithProcessRunner(firecracker.VMCommandBuilder{}.WithBin(runtime.FirecrackerBinary).Build(ctx)),
+		firecracker.WithLogger(logrus.NewEntry(logger)),
 	}
-	cmd := firecracker.VMCommandBuilder{}.
-		WithSocketPath(paths.SocketPath).
-		WithBin(binPath).
-		Build(ctx)
 
-	machine, err := firecracker.NewMachine(ctx, cfg, firecracker.WithProcessRunner(cmd))
+	machine, err := firecracker.NewMachine(ctx, cfg, machineOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("init machine: %w", err)
 	}
