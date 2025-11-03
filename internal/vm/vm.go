@@ -120,9 +120,9 @@ func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, 
 			VcpuCount:       firecracker.Int64(spec.CPUCount),
 			MemSizeMib:      firecracker.Int64(spec.MemSizeMb),
 			Smt:             firecracker.Bool(false),
-			TrackDirtyPages: firecracker.Bool(false),
+			// TrackDirtyPages: firecracker.Bool(false),
 		},
-		VmID: paths.SanitizedID,
+		VMID: paths.SanitizedID,
 	}
 
 	status := &Status{
@@ -164,12 +164,11 @@ func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, 
 		}
 	}
 
-	machineOpts := []firecracker.Opt{
-		firecracker.WithProcessRunner(firecracker.NewDefaultProcessRunner(runtime.FirecrackerBinary, logFile, logFile)),
-		firecracker.WithLogger(logrus.NewEntry(logger)),
-	}
+	// Use firecracker binary when making machine
+	// TODO: update below cmd binary location because i updated it manually before.
+	cmd := firecracker.VMCommandBuilder{}.WithSocketPath(paths.SocketPath).WithBin(filepath.Join("/usr/bin", "firecracker")).Build(ctx)
 
-	machine, err := firecracker.NewMachine(ctx, cfg, machineOpts...)
+	machine, err := firecracker.NewMachine(ctx, cfg, firecracker.WithProcessRunner(cmd))
 	if err != nil {
 		return nil, fmt.Errorf("init machine: %w", err)
 	}
