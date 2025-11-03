@@ -75,8 +75,14 @@ func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, 
 	}
 
 	_ = os.Remove(paths.SocketPath)
-	_ = os.Remove(paths.LogFifo)
-	_ = os.Remove(paths.MetricsFifo)
+	
+	// Force remove existing FIFOs before creating new ones
+	if _, err := os.Stat(paths.LogFifo); err == nil {
+		_ = os.Remove(paths.LogFifo)
+	}
+	if _, err := os.Stat(paths.MetricsFifo); err == nil {
+		_ = os.Remove(paths.MetricsFifo)
+	}
 
 	if err := makeFifo(paths.LogFifo); err != nil {
 		return nil, fmt.Errorf("create log fifo: %w", err)
@@ -319,7 +325,9 @@ func generateMAC() (string, error) {
 
 func makeFifo(path string) error {
 	if err := syscall.Mkfifo(path, 0o600); err != nil {
-		if errors.Is(err, os.ErrExist) {
+		if errors.Is(err, os.ErrExist) || 
+		   errors.Is(err, syscall.EEXIST) ||
+		   strings.Contains(strings.ToLower(err.Error()), "file exists") {
 			return nil
 		}
 		return err
