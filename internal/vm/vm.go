@@ -580,7 +580,6 @@ func applyMachineConfig(ctx context.Context, client *http.Client, cfg *Config) e
 	payload := map[string]interface{}{
 		"vcpu_count":   cfg.Machine.CPUCount,
 		"mem_size_mib": cfg.Machine.MemoryMB,
-		"ht_enabled":   false,
 	}
 	return putJSON(ctx, client, "/machine-config", payload)
 }
