@@ -14,291 +14,489 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
-
-	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
-	"github.com/firecracker-microvm/firecracker-go-sdk/client/models"
-	"github.com/sirupsen/logrus"
 )
 
-type Spec struct {
-	CPUCount  int64
-	MemSizeMb int64
+const (
+	defaultBridgeName  = "docker0"
+	rootImageName      = "rootfs.ext4"
+	kernelImageName    = "vmlinux.bin"
+	logFileName        = "firecracker.log"
+	sockFileName       = "firecracker.sock"
+	configFileName     = "config.json"
+	pidFileName        = "firecracker.pid"
+	bootArgsBase       = "ro console=ttyS0 noapic reboot=k panic=1 pci=off nomodules random.trust_cpu=on"
+	unixScheme         = "http://unix"
+	defaultHTTPTimeout = 10 * time.Second
+	defaultSocketWait  = 12 * time.Second
+)
+
+// Manager wires together image templates, per-VM volumes and Firecracker processes.
+type Manager struct {
+	rootDir         string
+	imagesDir       string
+	volumesDir      string
+	firecrackerPath string
 }
 
-type NetworkOptions struct {
-	TapDevice  string
-	HostIPCIDR string
-	MacAddress string
+// ManagerConfig exposes all configurable manager knobs.
+type ManagerConfig struct {
+	RootDir         string
+	ImagesDir       string
+	VolumesDir      string
+	FirecrackerPath string
 }
 
+// CreateOptions defines the metadata required to scaffold a new microVM workload.
 type CreateOptions struct {
-	ID      string
-	Spec    Spec
-	Network *NetworkOptions
+	Name      string
+	CPUCount  int
+	MemoryMB  int
+	GuestIP   string
+	GatewayIP string
+	Netmask   string
+	Bridge    string
+	TapDevice string
+	MacAddr   string
 }
 
-func Create(ctx context.Context, runtime Runtime, opts CreateOptions) (*Status, error) {
-	if strings.TrimSpace(opts.ID) == "" {
-		return nil, errors.New("id is required")
-	}
-	spec := opts.Spec
-	if spec.CPUCount <= 0 {
-		spec.CPUCount = 1
-	}
-	if spec.MemSizeMb <= 0 {
-		spec.MemSizeMb = 512
-	}
+// Config captures the persisted metadata for a microVM instance.
+type Config struct {
+	Name       string        `json:"name"`
+	KernelArgs string        `json:"kernel_args"`
+	Paths      ConfigPaths   `json:"paths"`
+	Network    NetworkConfig `json:"network"`
+	Machine    MachineSpec   `json:"machine"`
+	CreatedAt  time.Time     `json:"created_at"`
+}
 
-	paths := runtime.MachinePaths(opts.ID)
+// ConfigPaths lists on-disk artefacts tied to a VM instance.
+type ConfigPaths struct {
+	RootFS  string `json:"rootfs"`
+	Kernel  string `json:"kernel"`
+	Socket  string `json:"socket"`
+	LogFile string `json:"log_file"`
+	Config  string `json:"config"`
+	PIDFile string `json:"pid_file"`
+	WorkDir string `json:"workdir"`
+}
 
-	if _, err := os.Stat(paths.VolumeDir); err == nil {
-		return nil, fmt.Errorf("machine %s already exists", opts.ID)
-	}
-	if err := os.MkdirAll(paths.VolumeDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create volume dir: %w", err)
-	}
+// NetworkConfig reflects bridge and tap layout.
+type NetworkConfig struct {
+	Bridge    string `json:"bridge"`
+	TapDevice string `json:"tap_device"`
+	GuestIP   string `json:"guest_ip"`
+	GatewayIP string `json:"gateway_ip"`
+	Netmask   string `json:"netmask"`
+	MacAddr   string `json:"mac_addr"`
+}
 
-	cleanupVolume := true
-	defer func() {
-		if cleanupVolume {
-			_ = os.RemoveAll(paths.VolumeDir)
+// MachineSpec stores CPU and memory sizing.
+type MachineSpec struct {
+	CPUCount int `json:"cpu_count"`
+	MemoryMB int `json:"memory_mb"`
+}
+
+// NewManager resolves a Manager with sane defaults.
+func NewManager(cfg ManagerConfig) (*Manager, error) {
+	root := cfg.RootDir
+	if root == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("resolve working directory: %w", err)
 		}
-	}()
-
-	if err := copyFile(runtime.KernelImagePath, paths.KernelImage); err != nil {
-		return nil, fmt.Errorf("copy kernel image: %w", err)
-	}
-	if err := copyFile(runtime.RootfsImagePath, paths.RootfsImage); err != nil {
-		return nil, fmt.Errorf("copy rootfs image: %w", err)
+		root = cwd
 	}
 
-	_ = os.Remove(paths.SocketPath)
-	
-	// Force remove existing FIFOs before creating new ones
-	if _, err := os.Stat(paths.LogFifo); err == nil {
-		_ = os.Remove(paths.LogFifo)
-	}
-	if _, err := os.Stat(paths.MetricsFifo); err == nil {
-		_ = os.Remove(paths.MetricsFifo)
+	images := cfg.ImagesDir
+	if images == "" {
+		images = filepath.Join(root, "images")
+	} else if !filepath.IsAbs(images) {
+		images = filepath.Join(root, images)
 	}
 
-	logFile, err := os.OpenFile(paths.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open log file: %w", err)
+	volumes := cfg.VolumesDir
+	if volumes == "" {
+		volumes = filepath.Join(root, "volumes")
+	} else if !filepath.IsAbs(volumes) {
+		volumes = filepath.Join(root, volumes)
 	}
 
-	cleanupLog := true
-	defer func() {
-		if cleanupLog {
-			_ = logFile.Close()
-			_ = os.Remove(paths.LogFile)
+	fcPath := cfg.FirecrackerPath
+	if fcPath == "" {
+		fcPath = "firecracker"
+	}
+
+	return &Manager{
+		rootDir:         root,
+		imagesDir:       images,
+		volumesDir:      volumes,
+		firecrackerPath: fcPath,
+	}, nil
+}
+
+// Create scaffolds a microVM directory, network layout and config artefacts.
+func (m *Manager) Create(ctx context.Context, opts CreateOptions) (*Config, error) {
+	if opts.Name == "" {
+		return nil, errors.New("missing VM name")
+	}
+	if opts.CPUCount <= 0 {
+		opts.CPUCount = 1
+	}
+	if opts.MemoryMB <= 0 {
+		opts.MemoryMB = 512
+	}
+	if opts.Bridge == "" {
+		opts.Bridge = defaultBridgeName
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	workDir := filepath.Join(m.volumesDir, opts.Name)
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create volume directory: %w", err)
+	}
+
+	sourceRoot := filepath.Join(m.imagesDir, rootImageName)
+	sourceKernel := filepath.Join(m.imagesDir, kernelImageName)
+
+	if _, err := os.Stat(sourceRoot); err != nil {
+		return nil, fmt.Errorf("template rootfs missing: %w", err)
+	}
+	if _, err := os.Stat(sourceKernel); err != nil {
+		return nil, fmt.Errorf("template kernel missing: %w", err)
+	}
+
+	tapName := opts.TapDevice
+	if tapName == "" {
+		tapName = fmt.Sprintf("fc-%s-tap0", opts.Name)
+	}
+
+	mac := opts.MacAddr
+	if mac == "" {
+		var err error
+		mac, err = generateMAC()
+		if err != nil {
+			return nil, fmt.Errorf("generate mac: %w", err)
 		}
-	}()
+	}
 
-	logger := logrus.New()
-	logger.SetOutput(logFile)
-	logger.SetLevel(logrus.InfoLevel)
+	netmask := opts.Netmask
+	if netmask == "" {
+		derivedMask, err := lookupBridgeNetmask(opts.Bridge)
+		if err != nil {
+			return nil, fmt.Errorf("derive bridge netmask: %w", err)
+		}
+		netmask = derivedMask
+	}
 
-	cfg := firecracker.Config{
-		SocketPath:      paths.SocketPath,
-		LogFifo:         paths.LogFifo,
-		MetricsFifo:     paths.MetricsFifo,
-		KernelImagePath: paths.KernelImage,
-		KernelArgs:      runtime.BootArgs,
-		Drives: []models.Drive{
-			{
-				DriveID:      firecracker.String(fmt.Sprintf("rootfs_%s", paths.SanitizedID)),
-				PathOnHost:   firecracker.String(paths.RootfsImage),
-				IsRootDevice: firecracker.Bool(true),
-				IsReadOnly:   firecracker.Bool(false),
-			},
+	gateway := opts.GatewayIP
+	if gateway == "" {
+		bridgeGateway, err := lookupBridgeGateway(opts.Bridge)
+		if err != nil {
+			return nil, fmt.Errorf("derive bridge gateway: %w", err)
+		}
+		gateway = bridgeGateway
+	}
+
+	if opts.GuestIP == "" {
+		return nil, errors.New("guest IP address must be specified")
+	}
+
+	rootDst := filepath.Join(workDir, rootImageName)
+	kernelDst := filepath.Join(workDir, kernelImageName)
+	socketPath := filepath.Join(workDir, sockFileName)
+	logPath := filepath.Join(workDir, logFileName)
+	configPath := filepath.Join(workDir, configFileName)
+	pidPath := filepath.Join(workDir, pidFileName)
+
+	if err := copyFile(sourceRoot, rootDst); err != nil {
+		return nil, fmt.Errorf("copy rootfs: %w", err)
+	}
+	if err := copyFile(sourceKernel, kernelDst); err != nil {
+		return nil, fmt.Errorf("copy kernel: %w", err)
+	}
+
+	if err := createLogFile(logPath); err != nil {
+		return nil, fmt.Errorf("prepare log file: %w", err)
+	}
+
+	if err := prepareNetwork(tapName, opts.Bridge); err != nil {
+		return nil, fmt.Errorf("configure network: %w", err)
+	}
+
+	bootArgs := fmt.Sprintf("%s ip=%s::%s:%s::eth0:off", bootArgsBase, opts.GuestIP, gateway, netmask)
+
+	result := &Config{
+		Name:       opts.Name,
+		KernelArgs: bootArgs,
+		Paths: ConfigPaths{
+			RootFS:  rootDst,
+			Kernel:  kernelDst,
+			Socket:  socketPath,
+			LogFile: logPath,
+			Config:  configPath,
+			PIDFile: pidPath,
+			WorkDir: workDir,
 		},
-		MachineCfg: models.MachineConfiguration{
-			VcpuCount:       firecracker.Int64(spec.CPUCount),
-			MemSizeMib:      firecracker.Int64(spec.MemSizeMb),
-			Smt:             firecracker.Bool(false),
-			// TrackDirtyPages: firecracker.Bool(false),
+		Network: NetworkConfig{
+			Bridge:    opts.Bridge,
+			TapDevice: tapName,
+			GuestIP:   opts.GuestIP,
+			GatewayIP: gateway,
+			Netmask:   netmask,
+			MacAddr:   strings.ToLower(mac),
 		},
-		VMID: paths.SanitizedID,
+		Machine: MachineSpec{
+			CPUCount: opts.CPUCount,
+			MemoryMB: opts.MemoryMB,
+		},
+		CreatedAt: time.Now().UTC(),
 	}
 
-	status := &Status{
-		ID:          opts.ID,
-		State:       "starting",
-		SocketPath:  paths.SocketPath,
-		VolumePath:  paths.VolumeDir,
-		LogFile:     paths.LogFile,
-		LogFifo:     paths.LogFifo,
-		MetricsFifo: paths.MetricsFifo,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+	if err := persistConfig(result); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
 	}
 
-	if opts.Network != nil && opts.Network.TapDevice != "" {
-		mac := opts.Network.MacAddress
-		if strings.TrimSpace(mac) == "" {
-			generated, err := generateMAC()
-			if err != nil {
-				return nil, fmt.Errorf("generate mac address: %w", err)
-			}
-			mac = generated
-		}
-		status.TapDevice = opts.Network.TapDevice
-		status.MacAddress = mac
-		status.HostIPCIDR = opts.Network.HostIPCIDR
+	// ensure stale socket/pid artefacts are absent post-create
+	_ = os.Remove(socketPath)
+	_ = os.Remove(pidPath)
 
-		if err := ensureTapDevice(ctx, opts.Network.TapDevice, opts.Network.HostIPCIDR); err != nil {
-			return nil, err
-		}
-
-		cfg.NetworkInterfaces = []firecracker.NetworkInterface{
-			{
-				StaticConfiguration: &firecracker.StaticNetworkConfiguration{
-					HostDevName: opts.Network.TapDevice,
-					MacAddress:  mac,
-				},
-			},
-		}
-	}
-
-	// machineOpts := []firecracker.Opt{
-	// 	firecracker.WithProcessRunner(firecracker.VMCommandBuilder{}.WithSocketPath(paths.SocketPath).
-	// 		WithBin(runtime.FirecrackerBinary).Build(ctx)),
-	// 	// firecracker.WithLogger(logrus.NewEntry(logger)),
-	// }
-
-	// machineOpts...
-
-	machine, err := firecracker.NewMachine(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("init machine: %w", err)
-	}
-
-	if err := machine.Start(ctx); err != nil {
-		return nil, fmt.Errorf("start machine: %w", err)
-	}
-
-	// go streamFIFO(paths.LogFifo, paths.LogFile)
-	// go streamFIFO(paths.MetricsFifo, "")
-
-	status.State = "running"
-	status.UpdatedAt = time.Now()
-	if err := status.Save(paths.StatusFile); err != nil {
-		_ = machine.Shutdown(context.Background())
-		return nil, err
-	}
-
-	cleanupLog = false
-	cleanupVolume = false
-
-	go monitorMachine(machine, paths.StatusFile, logFile)
-
-	return status, nil
+	return result, nil
 }
 
-func Stop(ctx context.Context, runtime Runtime, id string) (*Status, error) {
-	paths := runtime.MachinePaths(id)
-	status, err := LoadStatus(paths.StatusFile)
+// Start boots an existing microVM by launching firecracker and replaying the stored config.
+func (m *Manager) Start(ctx context.Context, name string) (err error) {
+	cfg, err := m.LoadConfig(name)
 	if err != nil {
-		return nil, err
-	}
-
-	client := newFirecrackerClient(paths.SocketPath)
-	stopCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-	if err := client.instanceAction(stopCtx, actionRequest{ActionType: "InstanceStop"}); err != nil {
-		if !isNotExist(err) {
-			return nil, err
-		}
-	}
-
-	waitCtx, cancelWait := context.WithTimeout(ctx, 60*time.Second)
-	defer cancelWait()
-	_ = waitForSocketRemoval(waitCtx, paths.SocketPath)
-
-	status.State = "stopped"
-	status.UpdatedAt = time.Now()
-	status.Error = ""
-	if err := status.Save(paths.StatusFile); err != nil {
-		return nil, err
-	}
-	return status, nil
-}
-
-func Delete(ctx context.Context, runtime Runtime, id string, removeTap bool) error {
-	paths := runtime.MachinePaths(id)
-	status, err := LoadStatus(paths.StatusFile)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return ErrNotFound
-		}
 		return err
 	}
 
-	if _, stopErr := Stop(ctx, runtime, id); stopErr != nil && !errors.Is(stopErr, ErrNotFound) {
-		return stopErr
+	if _, err := os.Stat(cfg.Paths.Socket); err == nil {
+		return fmt.Errorf("socket already present at %s; is the VM running?", cfg.Paths.Socket)
 	}
 
-	_ = os.Remove(paths.SocketPath)
-	_ = os.Remove(paths.LogFifo)
-	_ = os.Remove(paths.MetricsFifo)
-	if err := os.RemoveAll(paths.VolumeDir); err != nil {
-		return fmt.Errorf("remove volume dir: %w", err)
+	cmd := exec.Command(m.firecrackerPath,
+		"--api-sock", cfg.Paths.Socket,
+		"--log-path", cfg.Paths.LogFile,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err = cmd.Start(); err != nil {
+		return fmt.Errorf("start firecracker: %w", err)
 	}
 
-	if removeTap && status != nil && status.TapDevice != "" {
-		_ = runCommand(ctx, "ip", "link", "del", status.TapDevice)
+	cleanup := func() {
+		_ = cmd.Process.Kill()
+		_ = os.Remove(cfg.Paths.Socket)
+		_ = os.Remove(cfg.Paths.PIDFile)
+	}
+	defer func() {
+		if err != nil {
+			cleanup()
+		}
+	}()
+
+	if err = os.WriteFile(cfg.Paths.PIDFile, []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0o644); err != nil {
+		return fmt.Errorf("persist pid: %w", err)
+	}
+
+	go func() {
+		_ = cmd.Wait()
+		_ = os.Remove(cfg.Paths.Socket)
+	}()
+
+	if err = waitForSocket(ctx, cfg.Paths.Socket); err != nil {
+		return fmt.Errorf("await socket: %w", err)
+	}
+
+	httpClient := newUnixHTTPClient(cfg.Paths.Socket)
+
+	if err = applyMachineConfig(ctx, httpClient, cfg); err != nil {
+		return fmt.Errorf("configure machine: %w", err)
+	}
+	if err = applyBootSource(ctx, httpClient, cfg); err != nil {
+		return fmt.Errorf("configure boot: %w", err)
+	}
+	if err = applyDrive(ctx, httpClient, cfg); err != nil {
+		return fmt.Errorf("configure drive: %w", err)
+	}
+	if err = applyNetwork(ctx, httpClient, cfg); err != nil {
+		return fmt.Errorf("configure network: %w", err)
+	}
+	if err = issueAction(ctx, httpClient, "InstanceStart"); err != nil {
+		return fmt.Errorf("start instance: %w", err)
 	}
 
 	return nil
 }
 
-func monitorMachine(machine *firecracker.Machine, statusPath string, logFile *os.File) {
-	defer func() {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
-	}()
-
-	err := machine.Wait(context.Background())
-
-	st, loadErr := LoadStatus(statusPath)
-	if loadErr != nil {
-		return
+// Stop asks the running microVM to shutdown using a Ctrl+Alt+Del signal.
+func (m *Manager) Stop(ctx context.Context, name string) error {
+	cfg, err := m.LoadConfig(name)
+	if err != nil {
+		return err
 	}
 
-	if err != nil && !errors.Is(err, context.Canceled) {
-		st.State = "error"
-		st.Error = err.Error()
-	} else {
-		st.State = "stopped"
-		st.Error = ""
-	}
-	st.UpdatedAt = time.Now()
-	_ = st.Save(statusPath)
-}
-
-func ensureTapDevice(ctx context.Context, tapName, hostCIDR string) error {
-	if tapName == "" {
+	if _, err := os.Stat(cfg.Paths.Socket); os.IsNotExist(err) {
+		_ = os.Remove(cfg.Paths.PIDFile)
 		return nil
 	}
 
-	if err := runCommand(ctx, "ip", "link", "show", tapName); err != nil {
-		if err := runCommand(ctx, "ip", "tuntap", "add", "dev", tapName, "mode", "tap"); err != nil {
-			return fmt.Errorf("create tap device %s: %w", tapName, err)
+	httpClient := newUnixHTTPClient(cfg.Paths.Socket)
+	if err := issueAction(ctx, httpClient, "SendCtrlAltDel"); err != nil {
+		if _, statErr := os.Stat(cfg.Paths.Socket); os.IsNotExist(statErr) {
+			_ = os.Remove(cfg.Paths.PIDFile)
+			return nil
+		}
+		return err
+	}
+
+	// wait for socket removal which signals VM exit
+	deadline := time.Now().Add(defaultSocketWait)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(cfg.Paths.Socket); os.IsNotExist(err) {
+			_ = os.Remove(cfg.Paths.PIDFile)
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return errors.New("timed out waiting for VM shutdown")
+}
+
+// Delete tears down the VM, removes tap devices and deletes stored artefacts.
+func (m *Manager) Delete(ctx context.Context, name string) error {
+	cfg, err := m.LoadConfig(name)
+	if err != nil {
+		return err
+	}
+
+	if _, err := os.Stat(cfg.Paths.Socket); err == nil {
+		if stopErr := m.Stop(ctx, name); stopErr != nil {
+			return fmt.Errorf("stop before delete: %w", stopErr)
 		}
 	}
 
-	if hostCIDR != "" {
-		if err := runCommandAllowExists(ctx, "ip", "addr", "add", hostCIDR, "dev", tapName); err != nil {
-			return fmt.Errorf("assign ip to tap %s: %w", tapName, err)
-		}
+	if err := removeTap(cfg.Network.TapDevice); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove tap: %w", err)
 	}
 
-	if err := runCommand(ctx, "ip", "link", "set", tapName, "up"); err != nil {
-		return fmt.Errorf("bring tap %s up: %w", tapName, err)
+	if err := os.RemoveAll(cfg.Paths.WorkDir); err != nil {
+		return fmt.Errorf("remove volume: %w", err)
+	}
+
+	return nil
+}
+
+// LoadConfig reads an existing VM config from disk.
+func (m *Manager) LoadConfig(name string) (*Config, error) {
+	if name == "" {
+		return nil, errors.New("missing VM name")
+	}
+
+	path := filepath.Join(m.volumesDir, name, configFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+func persistConfig(cfg *Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(cfg.Paths.Config, data, 0o644)
+}
+
+func copyFile(src, dst string) error {
+	if _, err := os.Stat(dst); err == nil {
+		return fmt.Errorf("destination already exists: %s", dst)
+	}
+
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func createLogFile(path string) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	return file.Close()
+}
+
+func prepareNetwork(tapName, bridgeName string) error {
+	if err := removeTap(tapName); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	if _, err := net.InterfaceByName(bridgeName); err != nil {
+		return fmt.Errorf("bridge %s not found: %w", bridgeName, err)
+	}
+
+	if err := runCommand("ip", "tuntap", "add", "dev", tapName, "mode", "tap"); err != nil {
+		return fmt.Errorf("add tap: %w", err)
+	}
+
+	if err := runCommand("sysctl", "-w", fmt.Sprintf("net.ipv4.conf.%s.proxy_arp=1", tapName)); err != nil {
+		return fmt.Errorf("enable proxy_arp: %w", err)
+	}
+	if err := runCommand("sysctl", "-w", fmt.Sprintf("net.ipv6.conf.%s.disable_ipv6=1", tapName)); err != nil {
+		return fmt.Errorf("disable ipv6: %w", err)
+	}
+
+	if err := runCommand("ip", "link", "set", "dev", tapName, "master", bridgeName); err != nil {
+		return fmt.Errorf("attach tap to bridge: %w", err)
+	}
+
+	if err := runCommand("ip", "link", "set", "dev", tapName, "up"); err != nil {
+		return fmt.Errorf("bring tap up: %w", err)
+	}
+
+	return nil
+}
+
+func removeTap(tapName string) error {
+	if err := runCommand("ip", "link", "del", tapName); err != nil {
+		if strings.Contains(err.Error(), "Cannot find device") || strings.Contains(err.Error(), "not found") {
+			return os.ErrNotExist
+		}
+		return err
+	}
+	return nil
+}
+
+func runCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %s: %v (%s)", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -308,197 +506,140 @@ func generateMAC() (string, error) {
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	buf[0] &= 0xfe
-	buf[0] |= 0x02
+	buf[0] = (buf[0] | 2) & 0xfe
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]), nil
 }
 
-func makeFifo(path string) error {
-	if err := syscall.Mkfifo(path, 0o600); err != nil {
-		if errors.Is(err, os.ErrExist) || 
-		   errors.Is(err, syscall.EEXIST) ||
-		   strings.Contains(strings.ToLower(err.Error()), "file exists") {
-			fmt.Println("❌ --- ", err)
+func lookupBridgeNetmask(bridgeName string) (string, error) {
+	ipnet, err := bridgeIPv4Net(bridgeName)
+	if err != nil {
+		return "", err
+	}
+	return maskToString(ipnet.Mask)
+}
+
+func lookupBridgeGateway(bridgeName string) (string, error) {
+	ipnet, err := bridgeIPv4Net(bridgeName)
+	if err != nil {
+		return "", err
+	}
+	return ipnet.IP.String(), nil
+}
+
+func bridgeIPv4Net(name string) (*net.IPNet, error) {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, err
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+			return ipnet, nil
+		}
+	}
+	return nil, fmt.Errorf("bridge %s missing IPv4 configuration", name)
+}
+
+func maskToString(mask net.IPMask) (string, error) {
+	if len(mask) != 4 {
+		return "", fmt.Errorf("unexpected mask length %d", len(mask))
+	}
+	return fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3]), nil
+}
+
+func waitForSocket(ctx context.Context, path string) error {
+	deadline := time.Now().Add(defaultSocketWait)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if _, err := os.Stat(path); err == nil {
 			return nil
 		}
-		return err
+		time.Sleep(200 * time.Millisecond)
 	}
-	return nil
+	return fmt.Errorf("socket %s not created within timeout", path)
 }
 
-func streamFIFO(path, logPath string) {
-	file, err := os.OpenFile(path, os.O_RDONLY, 0o600)
-	if err != nil {
-		return
+func newUnixHTTPClient(socketPath string) *http.Client {
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socketPath)
+		},
 	}
-	defer file.Close()
-
-	var writer io.Writer
-	if logPath != "" {
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			writer = io.Discard
-		} else {
-			defer f.Close()
-			writer = f
-		}
-	} else {
-		writer = io.Discard
-	}
-
-	_, _ = io.Copy(writer, file)
+	return &http.Client{Transport: transport, Timeout: defaultHTTPTimeout}
 }
 
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
+func applyMachineConfig(ctx context.Context, client *http.Client, cfg *Config) error {
+	payload := map[string]interface{}{
+		"vcpu_count":   cfg.Machine.CPUCount,
+		"mem_size_mib": cfg.Machine.MemoryMB,
+		"ht_enabled":   false,
 	}
-	defer in.Close()
-
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Close()
+	return putJSON(ctx, client, "/machine-config", payload)
 }
 
-type actionRequest struct {
-	ActionType string `json:"action_type"`
-}
-
-type firecrackerClient struct {
-	httpClient *http.Client
-}
-
-func newFirecrackerClient(socketPath string) *firecrackerClient {
-	transport := &http.Transport{}
-	transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-		d := net.Dialer{}
-		return d.DialContext(ctx, "unix", socketPath)
+func applyBootSource(ctx context.Context, client *http.Client, cfg *Config) error {
+	payload := map[string]interface{}{
+		"kernel_image_path": cfg.Paths.Kernel,
+		"boot_args":         cfg.KernelArgs,
 	}
-	transport.DisableCompression = true
-	return &firecrackerClient{httpClient: &http.Client{Transport: transport, Timeout: 5 * time.Second}}
+	return putJSON(ctx, client, "/boot-source", payload)
 }
 
-func (c *firecrackerClient) instanceAction(ctx context.Context, payload actionRequest) error {
-	return c.do(ctx, http.MethodPut, "/actions", payload)
-}
-
-func (c *firecrackerClient) do(ctx context.Context, method, path string, payload any) error {
-	var body io.Reader
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		body = bytes.NewReader(data)
+func applyDrive(ctx context.Context, client *http.Client, cfg *Config) error {
+	payload := map[string]interface{}{
+		"drive_id":       "rootfs",
+		"path_on_host":   cfg.Paths.RootFS,
+		"is_root_device": true,
+		"is_read_only":   false,
 	}
+	return putJSON(ctx, client, "/drives/rootfs", payload)
+}
 
-	req, err := http.NewRequestWithContext(ctx, method, "http://unix"+path, body)
+func applyNetwork(ctx context.Context, client *http.Client, cfg *Config) error {
+	payload := map[string]interface{}{
+		"iface_id":        "eth0",
+		"host_dev_name":   cfg.Network.TapDevice,
+		"guest_mac":       cfg.Network.MacAddr,
+		"rx_rate_limiter": nil,
+		"tx_rate_limiter": nil,
+	}
+	return putJSON(ctx, client, "/network-interfaces/eth0", payload)
+}
+
+func issueAction(ctx context.Context, client *http.Client, action string) error {
+	payload := map[string]string{"action_type": action}
+	return putJSON(ctx, client, "/actions", payload)
+}
+
+func putJSON(ctx context.Context, client *http.Client, path string, payload interface{}) error {
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, unixScheme+path, bytes.NewReader(body))
+	if err != nil {
+		return err
 	}
+	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("firecracker %s %s failed: %s", method, path, strings.TrimSpace(string(data)))
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("firecracker API %s failed: %s", path, strings.TrimSpace(string(b)))
 	}
 
-	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
-}
-
-func runCommand(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	var stderr bytes.Buffer
-	cmd.Stdout = io.Discard
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		output := strings.TrimSpace(stderr.String())
-		if output != "" {
-			return fmt.Errorf("%s %s: %s", name, strings.Join(args, " "), output)
-		}
-		return fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
-	}
-	return nil
-}
-
-func runCommandAllowExists(ctx context.Context, name string, args ...string) error {
-	err := runCommand(ctx, name, args...)
-	if err == nil {
-		return nil
-	}
-	if strings.Contains(err.Error(), "exists") {
-		return nil
-	}
-	return err
-}
-
-func isNotExist(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return true
-	}
-	if strings.Contains(strings.ToLower(err.Error()), "no such file") {
-		return true
-	}
-	return false
-}
-
-func waitForSocketRemoval(ctx context.Context, socketPath string) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if _, err := os.Stat(socketPath); errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
-func SanitizeID(id string) string {
-	if id == "" {
-		return ""
-	}
-	buf := make([]rune, 0, len(id))
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z':
-			buf = append(buf, r)
-		case r >= 'A' && r <= 'Z':
-			buf = append(buf, r)
-		case r >= '0' && r <= '9':
-			buf = append(buf, r)
-		case r == '_':
-			buf = append(buf, r)
-		default:
-			buf = append(buf, '_')
-		}
-	}
-	return string(buf)
 }
